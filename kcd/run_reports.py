@@ -102,15 +102,15 @@ def write_index(running):
              "<b class='run'>실행 중(15초마다 새로고침)</b>" if running else "<b>끝남</b>", done, fail, len(rows),
              (time.time() - t_all) // 60, html.escape(a.mode)),
          "<table><tr><th>번호</th><th>person_id</th><th>평가 시점</th><th>보고서</th><th>상태</th><th>문장</th><th>근거 일치</th>"
-         "<th>누락</th><th>확인 필요 항목</th><th>CDSS(높음/전체)</th><th>소요(초)</th></tr>"]
+         "<th>누락</th><th>확인 필요 항목</th><th>원자료 반영(미반영 항목)</th><th>CDSS(높음/전체)</th><th>소요(초)</th></tr>"]
     for no in sorted(rows):
         r = rows[no]
         st = r["status"]
         cls = "ok" if st.startswith("완료") else ("fail" if st.startswith("실패") else ("run" if st == "진행 중" else "muted"))
         link = "<a href='%s' target='_blank'>열기</a>" % html.escape(r["link"]) if r["link"] else "-"
-        H.append("<tr><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td class='%s'>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+        H.append("<tr><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td class='%s'>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
             no, html.escape(str(r["person_id"])), html.escape(str(r.get("index_datetime") or r.get("index_date") or "")), link, cls, html.escape(st),
-            r.get("n", "-"), r.get("sup", "-"), r.get("miss", "-"), r.get("gap", "-"), r.get("cdss", "-"), r["secs"]))
+            r.get("n", "-"), r.get("sup", "-"), r.get("miss", "-"), r.get("gap", "-"), r.get("raw", "-"), r.get("cdss", "-"), r["secs"]))
     H.append("</table><p class='muted'>보고서에는 실제 환자 정보가 있으므로 분석환경 밖으로 반출하지 마세요.</p></body></html>")
     allrows = dict(prev)
     allrows.update({k: v for k, v in rows.items()})
@@ -133,7 +133,7 @@ for no in sorted(rows):
         if (a.resume and os.path.isdir(os.path.join(a.out, "reports"))) else []
     if exist:
         old = prev.get(no, {})
-        x.update({k: old[k] for k in ("n", "sup", "miss", "gap", "cdss", "link", "secs") if old.get(k) not in (None, "")})
+        x.update({k: old[k] for k in ("n", "sup", "miss", "gap", "raw", "cdss", "link", "secs") if old.get(k) not in (None, "")})
         x.update(status="완료(이전 실행)", link=x.get("link") or "reports/" + sorted(exist)[-1])
         write_index(True)
         continue
@@ -152,7 +152,8 @@ for no in sorted(rows):
         m = r["metrics"]
         rep = r.get("report") or ""
         x.update(status="완료", link=os.path.relpath(rep[:-3] + ".html", a.out) if rep else "", n=m.get("n_sentences"), sup=m.get("supported"),
-                 miss=m.get("missing"), gap=m.get("checklist_gap"), cdss="%s/%s" % (m.get("alerts_high", 0), m.get("alerts_total", 0)))
+                 miss=m.get("missing"), gap=m.get("checklist_gap"), cdss="%s/%s" % (m.get("alerts_high", 0), m.get("alerts_total", 0)),
+                 raw=("%s%% (%s)" % (m.get("raw_used_pct"), m.get("raw_items_unused"))) if m.get("raw_used_pct") is not None else "-")
         want = str(x.get("index_datetime") or "")[5:16]
         got = pd.Timestamp(r["ctx"].t0).strftime("%m-%d %H:%M")
         if want and want != got:

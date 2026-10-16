@@ -2910,9 +2910,20 @@ class LLM(object):
                            "temperature": temperature, "max_tokens": max_tokens}).encode("utf-8")
         req = urllib.request.Request(self.base.rstrip("/") + "/chat/completions", data=body,
                                      headers={"Content-Type": "application/json", "Authorization": "Bearer " + self.key})
-        with urllib.request.urlopen(req, timeout=300) as r:
-            out = json.loads(r.read().decode("utf-8"))
+        t1 = time.time()
+        self.n = getattr(self, "n", 0) + 1
+        to = float(os.environ.get("KCD_LLM_TIMEOUT", 300))
+        sys.stderr.write("[llm] 호출 %d 시작(%s, 최대 %d초)...\n" % (self.n, self.model, to))
+        sys.stderr.flush()
+        try:
+            with urllib.request.urlopen(req, timeout=to) as r:
+                out = json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            sys.stderr.write("[llm] 호출 %d 실패 %.1f초: %r\n" % (self.n, time.time() - t1, e))
+            raise
         txt = out["choices"][0]["message"].get("content") or ""
+        u = out.get("usage") or {}
+        sys.stderr.write("[llm] 호출 %d 완료 %.1f초, 출력 %d자, 토큰 %s\n" % (self.n, time.time() - t1, len(txt), u.get("total_tokens", "-")))
         # 추론 모델의 <think>…</think> 는 버림(안의 '- ' 줄이 인계 문장으로 섞이지 않도록). 닫는 태그가 없으면(잘림) 빈 응답 취급
         if "<think>" in txt or "</think>" in txt:
             txt = txt.split("</think>", 1)[1] if "</think>" in txt else ""
@@ -4106,6 +4117,7 @@ def report_markdown(ctx, res, series):
         src = sorted({p.get("table", "파생") for p in f.prov if isinstance(p, dict)}) or ["-"]
         L.append("| %s | %s | %s | %s |" % (f.fid, f.ftype, f.text.replace("|", "/")[:120], ", ".join(src)))
     L += ["", "- 한계: 검증기는 문장이 추출된 fact와 맞는지를 확인합니다. 원자료에서 fact를 뽑는 단계의 오류(측정 오류값, 라벨 오인식)는 이 표로 확인할 수 없어 의료진 검토가 필요합니다."]
+    L += ["", "### 원자료 사용률(원자료 → 근거 자료, 3단계 점검)", ""] + raw_usage_markdown(res.get("raw_usage"))
     L += ["", "## 4. 부모님 요약지(보호자 Daily Briefing, 간호사 확인 전)", ""] + [
         l.replace("## ", "### ", 1) if l.startswith("## ") else l
         for l in parent_markdown(ctx, q["sents"], res["facts"], res["alerts"], sid_=res.get("ssot_id")).splitlines()[1:]]
@@ -4256,6 +4268,143 @@ def raw_match(ctx, facts, x, limit=3):
     return hits[:limit]
 
 
+# ---------------------------------------------------------------------------
+# 원자료 사용률 점검(3단계): 집계 구간의 원자료 항목이 근거 자료(fact)에 반영됐는지 항목 단위로 판정.
+#   인용      = 그 항목의 원자료 행이 fact 출처(prov)에 있음
+#   개념 요약 = 항목이 매핑된 개념(hr·k·urine 등)으로 만든 fact 가 있음(범위·합계처럼 여러 행을 요약)
+#   이름 일치 = 항목 이름(또는 개념 표시명)이 fact 문장에 나옴
+#   미반영    = 위 어디에도 해당 없음 → 의료진이 목록을 보고 빠뜨려도 되는지 판단
+#   제외      = 프로파일 raw_audit.ignore_regex 에 맞는 항목(장비 설정값 등)
+# 집계 구간: 요약 집계 구간(직전 24시간). 미생물은 ICU 입실 이후 전체(결과 대기 추적용).
+# ---------------------------------------------------------------------------
+RAW_AUDIT_TABLES = [   # (테이블, ctx 속성, 구간 기준)
+    ("CHARTEVENTS", "chart", "point"), ("LABEVENTS", "lab", "point"), ("INPUTEVENTS", "inp", "span"), ("OUTPUTEVENTS", "out", "point"),
+    ("EMAR", "emar", "point"), ("PRESCRIPTIONS", "rx", "span"), ("PROCEDUREEVENTS", "proc", "span"), ("MICROBIOLOGYEVENTS", "micro", "stay"),
+    ("TESTEVENTS", "test", "point"), ("DATETIMEEVENTS", "dte", "point")]
+RAW_STATUS_KO = {"cited": "인용", "concept": "개념 요약", "name": "이름 일치", "unused": "미반영", "ignored": "제외(프로파일)"}
+
+
+def _concept_names():
+    d = {}
+    for row in CHART_CONCEPTS:
+        d.setdefault(row[0], set()).add(row[1])
+    for row in LAB_CONCEPTS:
+        d.setdefault(row[0], set()).add(row[1])
+    for k, v in LAB_DISPLAY.items():
+        d.setdefault(k, set()).add(v)
+    return d
+
+
+def _audit_frame(ctx, table, attr, kind):
+    df = getattr(ctx, attr, None)
+    if df is None or df.empty:
+        return None
+    df = df.copy()
+    if "t" not in df.columns:
+        tc = next((c for c in ("charttime", "starttime", "chartdate") if c in df.columns), None)
+        if tc is None:
+            return None
+        df["t"] = to_dt(df[tc])
+    if kind == "stay":
+        m = (df["t"] >= ctx.intime) & (df["t"] <= ctx.t0)
+    elif kind == "span":
+        end = df["t_end"] if "t_end" in df.columns else (df["t_stop"] if "t_stop" in df.columns else df["t"])
+        m = (df["t"] <= ctx.t0) & (end.isna() | (end >= ctx.win_start) | (df["t"] >= ctx.win_start))
+    else:
+        m = (df["t"] >= ctx.win_start) & (df["t"] <= ctx.t0)
+    return df[m & df["t"].notna()]
+
+
+def _audit_label(ctx, table, r):
+    if table == "EMAR":
+        return str(r.get("medication") or "")
+    if table == "PRESCRIPTIONS":
+        return str(r.get("drug") or "")
+    if table == "MICROBIOLOGYEVENTS":
+        return " ".join(str(r.get(c)) for c in ("spec_type_desc", "test_name") if pd.notna(r.get(c)) and str(r.get(c)) not in ("", "nan"))
+    if table == "TESTEVENTS" and ctx.d_test is not None and not ctx.d_test.empty and "itemid" in ctx.d_test.columns:
+        lab = dict(zip(ctx.d_test["itemid"], ctx.d_test.get("label", ctx.d_test["itemid"])))
+        return str(lab.get(r.get("itemid"), r.get("itemid")))
+    return str(_raw_label(ctx, r) or r.get("itemid") or "")
+
+
+def raw_usage(ctx, facts):
+    """반환: {"tables": [...], "items": [...], "n_items", "n_used", "n_unused", "n_ignored", "n_rows", "pct"}"""
+    cited = defaultdict(set)
+    for f in facts:
+        for p in f.prov:
+            if isinstance(p, dict) and p.get("table"):
+                cited[p["table"]].add(str(p.get("row_id")))
+    fcon = set().union(*[f.concepts for f in facts]) if facts else set()
+    ftxt = " ".join(f.text for f in facts).lower()
+    cnames = _concept_names()
+    ign = [re.compile(x, re.I) for x in (PROFILE.get("raw_audit", {}) or {}).get("ignore_regex", [])]
+    items, tables = [], []
+    for table, attr, kind in RAW_AUDIT_TABLES:
+        df = _audit_frame(ctx, table, attr, kind)
+        if df is None or df.empty:
+            continue
+        idc = RAW_SRC.get(table, (None, None))[1]
+        df["_lab"] = [_audit_label(ctx, table, r) for _, r in df.iterrows()]
+        df["_id"] = df[idc].astype(str) if (idc and idc in df.columns) else df.index.astype(str)
+        if table in ("EMAR", "PRESCRIPTIONS") and "generic" in df.columns:
+            df["_con"] = df["generic"].map(lambda g: ("med:" + str(g).lower()) if pd.notna(g) and g else None)
+        else:
+            df["_con"] = df["concept"] if "concept" in df.columns else None
+        nt = {"rows": len(df), "items": 0, "used": 0, "unused": 0}
+        for lab, g in df.groupby("_lab", sort=False):
+            con = g["_con"].dropna().iloc[0] if g["_con"].notna().any() else None
+            core = re.sub(r"\(.*?\)|\[.*?\]", "", str(lab)).strip().lower()
+            names = {core} | {n.lower() for n in cnames.get(con, set())}
+            if ign and any(rx.search(str(lab)) for rx in ign):
+                st = "ignored"
+            elif set(g["_id"]) & cited.get(table, set()):
+                st = "cited"
+            elif con and con not in ("in_other", "output_other", "datetime") and con in fcon:
+                st = "concept"
+            elif any(len(n) >= 2 and n in ftxt for n in names if n):
+                st = "name"
+            else:
+                st = "unused"
+            last = g.sort_values("t").iloc[-1]
+            val = next((str(last.get(c)) for c in ("value", "amount", "dose_val_rx", "event_txt", "org_name", "interpretation")
+                        if c in g.columns and pd.notna(last.get(c)) and str(last.get(c)) not in ("", "nan")), "")
+            unit = next((str(last.get(c)) for c in ("valueuom", "amountuom", "dose_unit_rx") if c in g.columns and pd.notna(last.get(c)) and str(last.get(c)) not in ("", "nan")), "")
+            items.append({"table": table, "label": str(lab) or "(이름 없음)", "n": len(g), "last_t": fmt_t(last["t"]), "last_v": (val + " " + unit).strip(),
+                          "status": st, "concept": con or "", "mapped": bool(con and con not in ("in_other", "output_other")), "ids": g["_id"].tail(3).tolist()})
+            nt["items"] += 1
+            nt["used"] += st in ("cited", "concept", "name")
+            nt["unused"] += st == "unused"
+        tables.append(dict(nt, table=table))
+    n_items = sum(t["items"] for t in tables)
+    n_ign = sum(1 for x in items if x["status"] == "ignored")
+    n_used = sum(t["used"] for t in tables)
+    base = n_items - n_ign
+    return {"tables": tables, "items": items, "n_items": n_items, "n_used": n_used, "n_unused": sum(t["unused"] for t in tables), "n_ignored": n_ign,
+            "n_rows": sum(t["rows"] for t in tables), "pct": round(100.0 * n_used / base, 1) if base else None,
+            "window": "%s ~ %s (미생물은 ICU 입실 이후)" % (fmt_t(ctx.win_start), fmt_t(ctx.t0))}
+
+
+def raw_usage_markdown(ru):
+    if not ru or not ru["n_items"]:
+        return ["- 집계 구간에 원자료 항목 없음."]
+    L = ["- 집계 구간 %s. 원자료 %d행, 항목 %d개 중 %d개 반영(%s%%), 미반영 %d개, 제외 %d개." % (
+        ru["window"], ru["n_rows"], ru["n_items"], ru["n_used"], fmt_num(ru["pct"]) if ru["pct"] is not None else "-", ru["n_unused"], ru["n_ignored"]),
+        "- 판정: 인용(원자료 행이 근거에 있음) · 개념 요약(같은 개념으로 만든 근거가 있음) · 이름 일치(항목명이 근거 문장에 나옴) · 미반영.", "",
+        "| 테이블 | 원자료 행 | 항목 | 반영 | 미반영 |", "|---|---|---|---|---|"]
+    for t in ru["tables"]:
+        L.append("| %s | %d | %d | %d | %d |" % (t["table"], t["rows"], t["items"], t["used"], t["unused"]))
+    un = sorted([x for x in ru["items"] if x["status"] == "unused"], key=lambda x: -x["n"])
+    if un:
+        L += ["", "미반영 항목(건수 많은 순, 빠뜨려도 되는지 의료진 확인)", "", "| 테이블 | 항목 | 건수 | 마지막 시각 | 마지막 값 | 개념 매핑 |", "|---|---|---|---|---|---|"]
+        for x in un[:60]:
+            L.append("| %s | %s | %d | %s | %s | %s |" % (x["table"], x["label"].replace("|", "/"), x["n"], x["last_t"], x["last_v"].replace("|", "/")[:40],
+                                                          x["concept"] or "없음"))
+        if len(un) > 60:
+            L.append("| … | 외 %d개 | | | | |" % (len(un) - 60))
+    return L
+
+
 def _rows_html(rows):
     if not rows:
         return "<div class='muted'>연결된 원자료 행 없음(고정 문구·계산값·데이터 없음 표시)</div>"
@@ -4305,6 +4454,49 @@ def sentence_html(ctx, x, v, F, sid_anchor=True):
     return "<li%s>%s %s</li>" % (anchor, "".join(parts), badge)
 
 
+def raw_usage_html(res):
+    ru = res.get("raw_usage")
+    ctx = res["ctx"]
+    if not ru or not ru["n_items"]:
+        return "<h3>원자료 사용률</h3><p class='muted'>집계 구간에 원자료 항목 없음.</p>"
+    un = sorted([x for x in ru["items"] if x["status"] == "unused"], key=lambda x: -x["n"])
+    H = ["<h3>원자료 사용률 — 원자료 중 근거 자료로 쓰이지 않은 것</h3>",
+         "<div class='kpis'><div class='kpi %s'><b>%s%%</b><span>원자료 항목 반영(%d개 중 %d개)</span></div>" % (
+             "ok" if not un else "warn", fmt_num(ru["pct"]) if ru["pct"] is not None else "-", ru["n_items"] - ru["n_ignored"], ru["n_used"]) +
+         "<div class='kpi %s'><b>%d</b><span>미반영 항목(아래 목록, 의료진 확인)</span></div>" % ("ok" if not un else "warn", len(un)) +
+         "<div class='kpi'><b>%d</b><span>집계 구간 원자료 행</span></div>" % ru["n_rows"] +
+         "<div class='kpi'><b>%d</b><span>제외(프로파일 raw_audit)</span></div></div>" % ru["n_ignored"],
+         "<p class='muted'>집계 구간 %s. 항목 단위 판정: <b>인용</b> 원자료 행이 근거에 있음 · <b>개념 요약</b> 같은 개념(예: HR 범위)으로 만든 근거가 있음 · "
+         "<b>이름 일치</b> 항목명이 근거 문장에 나옴 · <b>미반영</b> 어디에도 없음. 빠져도 되는 항목은 프로파일 raw_audit.ignore_regex 에 넣으면 다음부터 '제외'.</p>" % _esc(ru["window"]),
+         "<table><tr><th>테이블</th><th>원자료 행</th><th>항목</th><th>반영</th><th>미반영</th></tr>"]
+    for t in ru["tables"]:
+        H.append("<tr><td>%s</td><td>%d</td><td>%d</td><td>%d</td><td class='%s'>%d</td></tr>" % (
+            t["table"], t["rows"], t["items"], t["used"], "warn" if t["unused"] else "", t["unused"]))
+    H.append("</table>")
+    if un:
+        H.append("<details open><summary>미반영 항목 %d개(건수 많은 순)</summary><table><tr><th>테이블</th><th>항목</th><th>건수</th><th>마지막 시각</th>"
+                 "<th>마지막 값</th><th>개념 매핑</th></tr>" % len(un))
+        for x in un[:100]:
+            attr, idc, _ = RAW_SRC.get(x["table"], (None, None, None))
+            df = getattr(ctx, attr, None) if attr else None
+            rows = []
+            if df is not None and not df.empty and idc in df.columns:
+                for _, r in df[df[idc].astype(str).isin(x["ids"])].iterrows():
+                    rows.append(_raw_row(ctx, x["table"], r, idc))
+            H.append("<tr><td>%s</td><td><span class='tip num hit' tabindex='0'>%s<span class='pop wide'><b>최근 원자료 행</b>%s</span></span></td>"
+                     "<td>%d</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (x["table"], _esc(x["label"]), _rows_html(rows), x["n"], _esc(x["last_t"]),
+                                                                       _esc(x["last_v"][:40]), _esc(x["concept"] or "없음")))
+        if len(un) > 100:
+            H.append("<tr><td colspan='6' class='muted'>외 %d개(report.md 참고)</td></tr>" % (len(un) - 100))
+        H.append("</table></details>")
+    used = [x for x in ru["items"] if x["status"] in ("cited", "concept", "name")]
+    if used:
+        H.append("<details><summary>반영된 항목 %d개(판정 근거 보기)</summary><table><tr><th>테이블</th><th>항목</th><th>건수</th><th>판정</th><th>개념</th></tr>%s</table></details>" % (
+            len(used), "".join("<tr><td>%s</td><td>%s</td><td>%d</td><td>%s</td><td>%s</td></tr>" % (
+                x["table"], _esc(x["label"]), x["n"], RAW_STATUS_KO[x["status"]], _esc(x["concept"])) for x in used)))
+    return "".join(H)
+
+
 def coverage_panel_html(res, doc_label=("1일 요약지", "부모님 요약지")):
     """필수 정보 점검: 명세 요소별 상태 칸 + 중요 fact 미인용 점검."""
     s = res["summary"]
@@ -4351,7 +4543,9 @@ def coverage_panel_html(res, doc_label=("1일 요약지", "부모님 요약지")
         h.append("<details open><summary>문서에 안 쓰인 중요 fact %d개</summary><ul>%s</ul></details>" % (
             len(unc), "".join("<li>%s %s</li>" % (f.fid, _esc(f.text)) for f in unc)))
     h.append("<div class='legend'><span class='cell ok'>반영</span><span class='cell warn'>데이터 없음·확인 필요</span>"
-             "<span class='cell bad'>문서에서 누락</span><span class='cell na'>조건부·해당 없음</span></div></section>")
+             "<span class='cell bad'>문서에서 누락</span><span class='cell na'>조건부·해당 없음</span></div>")
+    h.append(raw_usage_html(res))
+    h.append("</section>")
     return "\n".join(h)
 
 
@@ -4655,6 +4849,11 @@ class Pipeline(object):
         audit.log("cdss", {"facts": [f.fid for f in facts]}, {"alerts": [a["rule_id"] for a in alerts]})
         judge = llm if (llm is not None and llm.ok) else None
         res = {"ctx": ctx, "facts": facts, "alerts": alerts, "ssot_id": ssot_id(ctx, facts)}
+        try:
+            res["raw_usage"] = raw_usage(ctx, facts)
+        except Exception as e:   # 점검 실패가 문서 생성을 막지 않도록
+            res["raw_usage"] = None
+            audit.log("raw_usage_error", {}, {"error": repr(e)})
         allm = {"stay_id": stay_id, "day": ctx.day_index, "mode": mode, "n_facts": len(facts), "neonate": ctx.is_neonate}
         for doc in docs:
             sents, stats = self.render(ctx, facts, alerts, doc, mode, llm, audit)
@@ -4687,6 +4886,9 @@ class Pipeline(object):
                                    "doctor_flags": [{"item": t, "facts": ids} for t, ids in doctor_flags(ctx, facts, alerts)]}, f, ensure_ascii=False, indent=1)
                 with open(os.path.join(sd, "verify_%s_%s.json" % (doc, mode)), "w", encoding="utf-8") as f:
                     json.dump({"metrics": m, "verdicts": vd, "coverage": cov, "checklist": chk, "sentences": sents}, f, ensure_ascii=False, indent=1, default=str)
+        ru = res.get("raw_usage") or {}
+        allm.update({"raw_rows": ru.get("n_rows"), "raw_items": ru.get("n_items"), "raw_items_used": ru.get("n_used"),
+                     "raw_items_unused": ru.get("n_unused"), "raw_items_ignored": ru.get("n_ignored"), "raw_used_pct": ru.get("pct")})
         allm["secs"] = round(time.time() - t1, 2)
         allm["ssot_id"] = res["ssot_id"]
         if sd and write and all(d in res for d in DOCS):
