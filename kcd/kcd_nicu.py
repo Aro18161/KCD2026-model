@@ -747,7 +747,7 @@ def load_profile(path=None):
     return p
 
 
-SOURCE_TYPES = ("facts", "med_class", "chart_regex", "proc_regex", "output_regex", "input_regex", "service", "micro_org_regex", "manual")
+SOURCE_TYPES = ("facts", "med_class", "chart_regex", "lab_regex", "proc_regex", "output_regex", "input_regex", "service", "micro_org_regex", "manual")
 
 
 def validate_profile(p):
@@ -832,6 +832,229 @@ def crit_of(c, lo, hi):
     return (v[0], v[1]) if v else (lo, hi)
 
 
+
+# =============================================================================
+# 2-c. 인계 명세 JSON (예: nicu_daily_handoff_spec.json) → 요약지 섹션·필수 요소로 변환
+#   - required_information 의 각 영역 = 요약지 섹션(순서·제목 그대로)
+#   - 각 requirement 문장을 요소로 나눠 데이터 출처를 연결. 데이터 없으면 "확인 필요", 조건부 요소는 기록 있을 때만
+#   - 영역에 "elements": [{"label", "sources", "conditional", "mention_regex"}] 를 쓰면 자동 분해 대신 그대로 사용
+#   - 영역에 "fact_types": [...] 를 쓰면 그 영역에 배치할 fact 종류를 직접 지정
+#   - report_context.required 의 시각 항목은 머리말에, hard_constraints·generation_instruction 은 LLM 지시문에 반영
+# =============================================================================
+
+SPEC_DEFAULT_FILE = "nicu_daily_handoff_spec.json"
+
+# 영역 id → 이 영역에 배치할 fact 종류(명세에 fact_types 가 있으면 그것을 우선)
+SPEC_FACT_MAP = {
+    "patient_basics": ["patient_info", "weight"],
+    "current_status_and_changes": ["severity", "diagnosis_main", "diagnosis_other", "prematurity", "procedure_icd", "resp_support", "resp_change",
+                                   "vitals_24h", "neo_events", "procedure", "crrt_episode", "aki"],
+    "feeding": ["feeding_24h"],
+    "intake_output": ["intake_24h", "urine_24h", "stool", "io_balance"],
+    "medications": ["med_active", "med_stopped", "med_status", "infusion_episode", "fluids"],
+    "test_results": ["lab_latest", "lab_change", "lab_normal", "lab_none", "bst_24h", "blood_gas", "micro_positive", "micro_negative", "imaging"],
+    "tubes_and_lines": ["drain"],
+    "precautions_and_next_actions": ["micro_pending"],
+}
+
+_F = lambda *t, **kw: dict({"type": "facts", "fact_types": list(t)}, **kw)
+# 영역 id → [(요소 문구 정규식, 출처 목록, 조건부 여부, 언급 정규식)]. 앞에서부터 처음 맞는 규칙을 씀
+SPEC_VOCAB = {
+    "patient_basics": [
+        (r"\bID\b|식별", [_F("patient_info")], False, None),
+        (r"나이|생후일|일령", [_F("patient_info")], False, r"생후|입원 \d+일째"),
+        (r"성별", [_F("patient_info")], False, r"남아|여아|성별"),
+        (r"체중|측정시각", [_F("weight")], False, r"체중|몸무게"),
+        (r"혈액형|ABO", [{"type": "lab_regex", "regex": "ABO|혈액형|blood ?group|Rh"}, {"type": "chart_regex", "regex": "혈액형|ABO|blood ?type"},
+                        {"type": "manual"}], False, r"혈액형|ABO"),
+        (r"재태|\bGA\b", [{"type": "chart_regex", "regex": "재태|gestational|\\bGA\\b|주수"}, {"type": "manual"}], False, r"재태|주수|\bGA\b"),
+        (r"PMA|교정", [{"type": "chart_regex", "regex": "\\bPMA\\b|교정|corrected|\\bCGA\\b"}, {"type": "manual"}], False, r"PMA|교정"),
+        (r"출생 ?체중", [{"type": "chart_regex", "regex": "출생 ?체중|birth ?weight"}, {"type": "manual"}], False, r"출생 ?체중"),
+    ],
+    "current_status_and_changes": [
+        (r"주요 문제|문제", [_F("severity", "diagnosis_main", "diagnosis_other", "prematurity")], False, r"중증도|진단"),
+        (r"호흡지원|산소", [_F("resp_support", "resp_change")], False, r"호흡 보조|산소|FiO2|CPAP|NIPPV|인공호흡"),
+        (r"활력", [_F("vitals_24h", "neo_events")], False, r"활력징후|HR|SpO2"),
+        (r"사건|광선|벤틸레이터|ventil|이탈", [_F("resp_change", "procedure", "crrt_episode"), {"type": "proc_regex", "regex": "photo|광선"},
+                                       {"type": "chart_regex", "regex": "광선|photo|발관|extubat|삽관|intubat"}], True, r"광선|발관|삽관|모드 변경"),
+        (r"중재|반응", [{"type": "chart_regex", "regex": "중재|intervention|반응|response"}], True, r"중재|반응"),
+        (r"보챔|BIS|상태 변화", [{"type": "chart_regex", "regex": "보챔|irritab|fuss|\\bBIS\\b|울음|crying"}], True, r"보챔|BIS"),
+    ],
+    "feeding": [
+        (r"종류|경로", [{"type": "input_regex", "regex": "경구|oral|Levin|\\bOG\\b|\\bNG\\b|feeding|경관|수유|모유|분유"},
+                     {"type": "chart_regex", "regex": "모유|분유|breast|formula|EBM|수유 ?종류"}, {"type": "manual"}], False, r"모유|분유|경관|경구|수유"),
+        (r"회당량|간격", [_F("feeding_24h"), {"type": "chart_regex", "regex": "회당|수유량|간격"}], False, r"회당|간격"),
+        (r"횟수|총량", [_F("feeding_24h")], False, r"수유 기록 \d+회|총 \d+"),
+        (r"보류|NPO|금식", [{"type": "chart_regex", "regex": "보류|hold|NPO|금식"}], True, r"보류|NPO|금식"),
+        (r"구토|팽만|특이", [{"type": "chart_regex", "regex": "잔류|residual|복부 ?팽만|distension|girth|구토|vomit|혈변|bloody"}], True, r"구토|팽만|잔류|혈변"),
+    ],
+    "intake_output": [
+        (r"섭취|배출", [_F("intake_24h", "io_balance")], False, r"섭취|배설"),
+        (r"소변|측정방법", [_F("urine_24h")], False, r"소변"),
+        (r"배변", [_F("stool")], False, r"배변|대변"),
+        (r"기저귀|순증량|혼합", [{"type": "output_regex", "regex": "기저귀|diaper|대소변|소변\\+대변"}, {"type": "chart_regex", "regex": "기저귀|diaper"}], True,
+         r"기저귀|대소변"),
+    ],
+    "medications": [
+        (r"약명|용량|단위|경로|투여시각|횟수", [_F("med_active", "med_stopped", "infusion_episode")], False, None),
+        (r"PRN", [{"type": "chart_regex", "regex": "\\bPRN\\b|필요 ?시"}], True, r"PRN|필요 시"),
+        (r"미투여|보류", [_F("med_status")], True, r"미투여|보류"),
+        (r"지속주입", [_F("infusion_episode", "fluids"), {"type": "med_class", "classes": ["nutrition", "vasopressor", "sedation"]}], True, r"지속주입|주입속도"),
+    ],
+    "test_results": [
+        (r"이상치|추세|정상범위|복귀|수치", [_F("lab_latest", "lab_change", "lab_normal", "lab_none", "bst_24h", "blood_gas")], False, None),
+    ],
+    "tubes_and_lines": [
+        (r"종류|위치|고정|현재 상태", [{"type": "proc_regex", "regex": LINE_RX + "|tube|튜브|gavage|ETT", "note": "제거 여부는 데이터로 확인되지 않음"},
+                                   {"type": "chart_regex", "regex": "insertion|삽입|catheter|카테터|UVC|UAC|PICC|PIV|ETT|tube|튜브|고정"}], False,
+         r"UVC|UAC|PICC|PIV|카테터|ETT|tube|튜브|라인"),
+        (r"연결 수액|주입속도", [_F("infusion_episode", "fluids"), {"type": "med_class", "classes": ["nutrition"]}], True, r"수액|주입"),
+        (r"배액|성상|삽입부", [_F("drain"), {"type": "chart_regex", "regex": "삽입부|site|배액|drain"}], True, r"배액|삽입부"),
+    ],
+    "precautions_and_next_actions": [
+        (r"알레르기", [{"type": "chart_regex", "regex": "알레르기|알러지|allergy|과민"}, {"type": "manual"}], False, r"알레르기|알러지|allergy"),
+        (r"격리", [{"type": "micro_org_regex", "regex": "MRSA|VRE|CRE|CRAB|CRPA|carbapenem|methicillin.resistant|vancomycin.resistant"},
+                 {"type": "chart_regex", "regex": "격리|isolation"}, {"type": "manual"}], False, r"격리|isolation"),
+        (r"결과 대기", [_F("micro_pending")], False, r"미보고|결과 대기"),
+        (r"예정 검사|예정시각|계획", [{"type": "chart_regex", "regex": "예정|계획|plan|schedule"}], True, r"예정|계획"),
+    ],
+}
+SPEC_COND_CUE = r"해당 시|있으면|했다면|여부"
+
+
+SPEC_RULE_NAME = {  # 요소 문구가 길 때 표에 쓸 짧은 이름
+    r"사건|광선|벤틸레이터|ventil|이탈": "중요 사건(광선치료·벤틸레이터 적용·이탈 등)",
+    r"중재|반응": "시행한 중재·반응",
+    r"보챔|BIS|상태 변화": "보챔 등 상태 변화(BIS)",
+    r"이상치|추세|정상범위|복귀|수치": "중요 이상치·변화 추세·정상범위 복귀값(수치·단위·시각)",
+}
+_JOIN_RX = re.compile(r"(?<!결)(?<=[가-힣)])(?:와|과) (?=\S)| 및 ")
+
+
+def _split_top(text, seps):
+    """괄호 밖의 구분자로만 나눔."""
+    out, buf, depth = [], "", 0
+    for ch in str(text):
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth = max(0, depth - 1)
+        if depth == 0 and ch in seps:
+            if buf.strip(" "):
+                out.append(buf.strip(" "))
+            buf = ""
+            continue
+        buf += ch
+    if buf.strip(" "):
+        out.append(buf.strip(" "))
+    return out
+
+
+def split_requirement(text):
+    """requirement 문장을 요소로 분해(괄호 밖 ',' '.' 기준). 끝맺음 표현은 제거."""
+    t = re.sub(r"\s*(를|을) (포함|함께 표시)합니다\.?|\s*합니다\.?$", "", str(text))
+    return [x.strip(" .") for x in _split_top(t, ",.") if x.strip(" .")]
+
+
+def spec_elements(item):
+    """명세 영역 → 요소 목록 [{label, sources, conditional, mention_regex}].
+    요소 안의 '·' 조각마다 규칙을 찾고, 규칙이 없는 조각은 같은 요소의 첫 규칙에 붙임. 같은 규칙은 하나로 합침.
+    조건 표현(해당 시·있으면·했다면·여부)은 조각 단위로 보고, 규칙의 모든 조각이 조건부일 때만 선택 요소로 둠."""
+    if item.get("elements"):
+        return [dict(e) for e in item["elements"]]
+    vocab = SPEC_VOCAB.get(item.get("id"), [r for v in SPEC_VOCAB.values() for r in v])
+    groups, unmatched = OrderedDict(), []
+    for el in split_requirement(item.get("requirement", "")):
+        pieces = []
+        for pc in (_split_top(el, "·") or [el]):
+            parts = _JOIN_RX.split(pc) if "(" not in pc else re.split(r"(?<=\))(?:와|과) ", pc)
+            pieces += [x.strip() for x in parts if x.strip()]
+        hit_rules, used = [], set()
+        for pc in pieces:  # 조각마다 처음 맞는 규칙 하나에 배정
+            rule = next((r for r in vocab if re.search(r[0], pc, re.I)), None)
+            if rule is None:
+                continue
+            if rule not in hit_rules:
+                hit_rules.append(rule)
+            g = groups.setdefault(rule[0], {"pieces": [], "rule": rule})
+            if pc not in g["pieces"]:
+                g["pieces"].append(pc)
+            used.add(pc)
+        if not hit_rules:
+            unmatched.append(el)
+            continue
+        rest = [pc for pc in pieces if pc not in used]
+        if rest:
+            groups[hit_rules[0][0]]["pieces"] += rest
+    els = []
+    for g in groups.values():
+        rx, sources, cond, mrx = g["rule"]
+        label = "·".join(g["pieces"])
+        if len(label) > 40:
+            label = SPEC_RULE_NAME.get(rx, label[:40] + "…")
+        all_cue = all(re.search(SPEC_COND_CUE, pc) for pc in g["pieces"])
+        e = {"label": label, "sources": sources, "conditional": bool(cond or all_cue)}
+        if mrx:
+            e["mention_regex"] = mrx
+        els.append(e)
+    for el in unmatched:  # 연결 규칙이 없는 요소: 데이터 출처 없음 → 조건 표현이 없으면 "확인 필요"
+        els.append({"label": el, "sources": [{"type": "manual"}], "conditional": bool(re.search(SPEC_COND_CUE, el)), "unmatched": True})
+    return els
+
+
+def load_spec(path):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def find_default_spec():
+    for d in (os.getcwd(), os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()):
+        p = os.path.join(d, SPEC_DEFAULT_FILE)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def spec_to_profile(p, spec, path=None):
+    """인계 명세를 프로파일의 요약지(documents.summary)로 변환. 기존 요약지 체크리스트는 대체됨."""
+    items = spec.get("required_information", [])
+    if not items:
+        raise SystemExit("명세에 required_information 이 없습니다: %s" % path)
+    secs, checklist, smap, unmatched = [], [], {}, []
+    for i, it in enumerate(items, 1):
+        sid = it.get("id") or "sec%d" % i
+        secs.append({"id": sid, "title": "%d. %s" % (i, it.get("label", sid))})
+        for ft in it.get("fact_types") or SPEC_FACT_MAP.get(sid, []):
+            smap[ft] = sid
+        for j, e in enumerate(spec_elements(it), 1):
+            ck = {"key": "%s_%d" % (sid, j), "label": e["label"], "section": sid, "required": not e.get("conditional", False),
+                  "sources": e.get("sources", [{"type": "manual"}]), "area": i}
+            if e.get("mention_regex"):
+                ck["mention_regex"] = e["mention_regex"]
+            if e.get("unmatched"):
+                unmatched.append("%s: %s" % (it.get("label", sid), e["label"]))
+            checklist.append(ck)
+    secs.append({"id": "cdss", "title": "참고: 규칙 기반 알림(CDSS, 인계문과 별도 확인용)"})
+    s = p["documents"]["summary"]
+    s.update({"title": spec.get("title", s["title"]) + " (자동 생성 초안, 의료진 검토 필요)", "sections": secs, "cdss_section": "cdss",
+              "section_cap": {x["id"]: 24 for x in secs}, "checklist": checklist})
+    p["section_of"] = dict(smap, **p.get("section_of", {}))
+    p["default_section"] = secs[1]["id"] if len(secs) > 2 else secs[0]["id"]
+    p.setdefault("severity", {})["section"] = smap.get("severity", p["default_section"])
+    p["_spec"] = {"path": path, "spec_id": spec.get("spec_id"), "version": spec.get("version"), "report_context": spec.get("report_context", {}),
+                  "hard_constraints": spec.get("hard_constraints", []), "generation_instruction": spec.get("generation_instruction", ""),
+                  "required_information": items, "unmatched": unmatched}
+    return p
+
+
+def spec_system_prompt():
+    S = PROFILE.get("_spec") or {}
+    req = "\n".join("- %s: %s" % (x.get("label"), x.get("requirement")) for x in S.get("required_information", []))
+    hc = "\n".join("- %s" % x for x in S.get("hard_constraints", []))
+    return ("%s\n\n[필수정보]\n%s\n\n[반드시 지킬 규칙]\n%s\n- 주어진 facts만 사용하고, 문장마다 끝에 사용한 fact_id를 [F001] 형식으로 인용한다\n"
+            "- 출력은 '- '로 시작하는 문장 목록만 쓴다." % (S.get("generation_instruction", ""), req, hc))
+
+
 # --------------------------------------------------------------- 체크리스트 평가
 
 
@@ -887,6 +1110,16 @@ def eval_source(ctx, facts, item, src, doc):
                 out.append(Fact("checklist_item", sec, "%s: %s %s(%s 기록)." % (item["label"], short, val, fmt_t(r["t"])), 2, concepts={pre + key},
                                 time=r["t"], prov=_prov(table, g.tail(1), idc)))
         return out[:3]
+    if t == "lab_regex":
+        L = ctx.lab
+        if L.empty:
+            return []
+        L = L[(L["t"] <= ctx.t0) & L["label"].astype(str).str.contains(rx, case=False, regex=True, na=False)]
+        if L.empty:
+            return []
+        r = L.sort_values("t").iloc[-1]
+        return [Fact("checklist_item", sec, "%s: %s %s(%s 검사)." % (item["label"], r["label"], r.get("value"), fmt_t(r["t"])), 2, concepts={pre + key},
+                     time=r["t"], prov=_prov("LABEVENTS", L.tail(1), "labevent_id"))]
     if t == "proc_regex":
         p = ctx.proc
         if p.empty:
@@ -1293,6 +1526,11 @@ def build_facts(ctx):
             f.section = PROFILE["section_of"][f.ftype]
         if f.ftype in PROFILE.get("salience", {}):
             f.salience = int(PROFILE["salience"][f.ftype])
+    dflt = PROFILE.get("default_section")
+    if dflt:
+        for f in facts:
+            if f.section not in SECTIONS:
+                f.section = dflt
     facts += apply_checklist(ctx, facts, "summary")
     facts += apply_checklist(ctx, facts, "parent")
     order = list(SECTIONS.keys()) + list(PARENT_SECTIONS.keys())
@@ -1666,6 +1904,20 @@ def nutrition_facts(ctx):
         ctx.intake_ml_kg_day = round(mkd)
         txt += ", %s mL/kg/일(체중 %s 기준%s)" % (fmt_num(round(mkd)), fmt_w(ctx.wt_kg), ", 24시간 환산" if H < 23 else "")
         nums.append(round(mkd))
+    fd = d[d["concept"].isin(["in_oral", "in_tube"])].sort_values("t")
+    if len(fd):
+        per = fd["v"].median()
+        gaps = fd["t"].diff().dropna().dt.total_seconds() / 3600.0
+        parts = []
+        for c, nm in (("in_oral", "경구"), ("in_tube", "경관")):
+            x = fd[fd["concept"] == c]
+            if len(x):
+                parts.append("%s %d회 %s mL" % (nm, len(x), fmt_num(round(x["v"].sum()))))
+        ftxt = "지난 %s시간 수유 기록 %d회, 총 %s mL(%s), 회당 중앙값 %s mL%s." % (
+            HH(ctx), len(fd), fmt_num(round(fd["v"].sum())), ", ".join(parts), fmt_num(round(per, 1)),
+            (", 간격 중앙값 %s시간" % fmt_num(round(gaps.median(), 1))) if len(gaps) else "")
+        facts.append(Fact("feeding_24h", "D4", ftxt, 3, concepts={"feeding", "intake"}, key_nums=[len(fd), round(fd["v"].sum())],
+                          prov=_prov("INPUTEVENTS", fd.head(3), "inputevent_id"), extra={"n": len(fd), "total": round(fd["v"].sum())}))
     facts.append(Fact("intake_24h", "D4", txt + ".", 3, concepts={"intake", "io"}, key_nums=nums, prov=_prov("INPUTEVENTS", d.head(3), "inputevent_id"),
                       extra={"total": round(total), "iv": round(sums["in_iv"]), "enteral": round(ent), "tube": round(sums["in_tube"]),
                              "oral": round(sums["in_oral"]), "mlkgday": ctx.intake_ml_kg_day}))
@@ -1860,8 +2112,9 @@ def med_facts(ctx):
                     if len(r):
                         rate = (float(r.iloc[-1]), "/min" if col.endswith("min") else "/hr")
                         break
+            n_win = int(((gg["t"] > ws) & (gg["t"] <= t0)).sum())
             rows.append(dict(generic=g, cls=gg["cls"].iloc[-1], name=gg["medication"].iloc[-1], first=gg["t"].min(), last=gg["t"].max(), source="EMAR",
-                             prov=_prov("EMAR", gg.tail(2), "emar_id"), rate=rate))
+                             prov=_prov("EMAR", gg.tail(2), "emar_id"), rate=rate, n_win=n_win))
     if not ctx.rx.empty:
         for _, x in ctx.rx[ctx.rx["t"] <= t0].iterrows():
             active = pd.isna(x["t_stop"]) or x["t_stop"] > t0
@@ -1876,8 +2129,14 @@ def med_facts(ctx):
             r["first"] = min(r["first"], by[k]["first"])
         if k not in by or (r["source"] == "EMAR" and by[k]["source"] != "EMAR") or (r["source"] == by[k]["source"] and r["last"] > by[k]["last"]):
             by[k] = r
+    rxinfo = {}
+    for r in rows:
+        if r["source"] == "PRESCRIPTIONS" and (r.get("dose") or r.get("route")):
+            rxinfo[r["generic"].lower()] = r
     fluids = []
     for k, r in by.items():
+        if r["source"] == "EMAR" and k in rxinfo:
+            r = dict(r, dose=rxinfo[k].get("dose"), route=rxinfo[k].get("route"))
         if r["source"] == "PRESCRIPTIONS":
             active = r.get("rx_active", False)
         else:
@@ -1911,7 +2170,8 @@ def med_facts(ctx):
                 txt = "%s%s(%s) 처방 유지 중%s%s, 처방 시작 %s%s." % ((ck + " ") if ck else "", r["generic"], r["name"], extra_txt, newtxt if new else "",
                                                               fmt_t(r["first"]), ", 종료 기록 없음" if r.get("open_end") else "")
             else:
-                txt = "%s%s(%s) 투여 중%s%s, 마지막 기록 %s." % ((ck + " ") if ck else "", r["generic"], r["name"], extra_txt, newtxt, fmt_t(r["last"]))
+                cnt = (", 지난 %s시간 투여 기록 %d회" % (HH(ctx), r["n_win"])) if r.get("n_win") else ""
+                txt = "%s%s(%s) 투여 중%s%s%s, 마지막 기록 %s." % ((ck + " ") if ck else "", r["generic"], r["name"], extra_txt, cnt, newtxt, fmt_t(r["last"]))
             facts.append(Fact("med_active", "D7", txt, 3 if r["cls"] in HIGH_ALERT else 2, concepts={"med:" + r["generic"].lower(), "cls:" + r["cls"]},
                               status="active", time=r["last"], prov=r["prov"], extra=ex))
         else:
@@ -2375,7 +2635,16 @@ def note_markdown(ctx, sents, verdicts=None, coverage=None, title=None, checklis
     secmap = SECTIONS if doc == "summary" else PARENT_SECTIONS
     vd = {v["sid"]: v for v in (verdicts or [])}
     if doc == "summary":
-        lines = ["# " + title, "", "- stay_id %s / hadm_id %s / 기준 시각 %s (%d/%d일째 요약)" % (ctx.stay_id, ctx.hadm_id, fmt_t(ctx.t0), ctx.day_index, ctx.n_days),
+        lines = ["# " + title, ""]
+        sp = PROFILE.get("_spec")
+        if sp:
+            hrs = (ctx.t0 - ctx.win_start).total_seconds() / 3600.0
+            val = {"요약 기준시각": fmt_t(ctx.t0), "집계 시작시각": fmt_t(ctx.win_start), "집계 종료시각": fmt_t(ctx.t0)}
+            for k in sp.get("report_context", {}).get("required", []):
+                lines.append("- %s: %s" % (k, val.get(k, "확인 필요")))
+            lines.append("- 집계 구분: %s(%s시간)" % ("24시간 요약" if hrs >= 23.5 else "부분 기간 요약(입실 후 24시간 미만)", fmt_num(round(hrs, 1))))
+            lines.append("- 명세: %s v%s" % (sp.get("spec_id"), sp.get("version")))
+        lines += ["- stay_id %s / hadm_id %s / 기준 시각 %s (%d/%d일째 요약)" % (ctx.stay_id, ctx.hadm_id, fmt_t(ctx.t0), ctx.day_index, ctx.n_days),
                  "- 생성: kcd_nicu.py v%s, 프로파일 %s, %s" % (VERSION, PROFILE.get("profile_name"), time.strftime("%Y-%m-%d %H:%M")), ""]
     else:
         lines = ["# " + title, "", "%s 기준" % pd.Timestamp(ctx.t0).strftime("%m월 %d일 %H시"), "", "> " + D.get("notice", ""), ""]
@@ -2405,7 +2674,7 @@ def note_markdown(ctx, sents, verdicts=None, coverage=None, title=None, checklis
                                                                      fmt_num(100 * (extra_metrics.get("read_english_sent_ratio") or 0))))
     if show_cites and checklist:
         gaps = [c for c in checklist if c["status"] == "gap"]
-        lines += ["", "## 필수 항목 체크리스트 (%s)" % PROFILE.get("profile_name", ""), "", "| 영역 | 항목 | 필수 | 데이터 | 문서 반영 | 근거 |", "|---|---|---|---|---|---|"]
+        lines += ["", "## 필수 항목 체크리스트 (%s)" % (("명세 %s v%s" % (PROFILE["_spec"]["spec_id"], PROFILE["_spec"]["version"])) if (PROFILE.get("_spec") and doc == "summary") else PROFILE.get("profile_name", "")), "", "| 영역 | 항목 | 필수 | 데이터 | 문서 반영 | 근거 |", "|---|---|---|---|---|---|"]
         lab = {"data": "있음", "gap": "없음(확인 필요)", "absent": "없음", "n/a": "해당 없음"}
         inl = {"covered": "반영", "missing": "누락", "n/a": "-"}
         for c in checklist:
@@ -2479,7 +2748,7 @@ def render_llm(ctx, facts, alerts, llm, audit, repair=True, max_rounds=2, doc="s
     plan = _doc_plan(facts, doc)
     F = {f.fid: f for f in facts}
     secmap = SECTIONS if doc == "summary" else PARENT_SECTIONS
-    sysp = SYS_GROUNDED if doc == "summary" else SYS_PARENT
+    sysp = (spec_system_prompt() if PROFILE.get("_spec") else SYS_GROUNDED) if doc == "summary" else SYS_PARENT
     sents = []
     for s, fs in plan.items():
         if not fs:
@@ -3068,8 +3337,19 @@ DOCS = ("summary", "parent")
 
 
 class Pipeline(object):
-    def __init__(self, data_dir, dur_csv=None, verbose=True, profile=None, cohort="nicu"):
-        apply_profile(load_profile(profile))
+    def __init__(self, data_dir, dur_csv=None, verbose=True, profile=None, cohort="nicu", spec=None):
+        prof = load_profile(profile)
+        spec = find_default_spec() if spec is None else (None if spec in ("none", "") else spec)
+        if spec:
+            prof = spec_to_profile(prof, load_spec(spec), spec)
+            validate_profile(prof)
+        apply_profile(prof)
+        if verbose and PROFILE.get("_spec"):
+            S = PROFILE["_spec"]
+            print("[spec] %s v%s (%s): 영역 %d개, 필수 요소 %d개" % (S["spec_id"], S["version"], os.path.basename(S["path"] or ""), len(S["required_information"]),
+                                                       sum(1 for c in PROFILE["documents"]["summary"]["checklist"] if c["required"])))
+            if S["unmatched"]:
+                print("[spec] 데이터 출처를 연결하지 못한 요소(항상 '확인 필요'로 표시): " + "; ".join(S["unmatched"]))
         self.verbose = verbose
         if verbose:
             print("[profile] %s (요약지 체크리스트 %d항목, 부모 설명지 %d항목)" % (PROFILE["profile_name"], len(PROFILE["documents"]["summary"]["checklist"]),
@@ -3222,7 +3502,7 @@ def write_summary(rows, out_dir, name):
 
 
 def mk(a):
-    return Pipeline(a.data, a.dur_csv, profile=a.profile, cohort=a.cohort)
+    return Pipeline(a.data, a.dur_csv, profile=a.profile, cohort=a.cohort, spec=a.spec)
 
 
 def cmd_list(a):
@@ -3551,7 +3831,7 @@ def expand_dirs(spec):
 def _sample_one_dir(a, data_dir):
     """한 데이터 폴더에서 적격 평가 시점과 단계별 흐름 계산. 반환: (rows, steps, flow)"""
     S = dict(SAMPLING_DEFAULT)
-    p = Pipeline(data_dir, a.dur_csv, verbose=False, profile=a.profile, cohort=a.cohort)
+    p = Pipeline(data_dir, a.dur_csv, verbose=False, profile=a.profile, cohort=a.cohort, spec=a.spec)
     S.update(PROFILE.get("sampling", {}))
     C = p.cands.copy()
     hadms = C["hadm_id"].tolist()
@@ -3692,6 +3972,7 @@ def kcd_main(argv=None):
         s = sp.add_parser(name)
         s.add_argument("--data", required=(name != "init-profile"))
         s.add_argument("--profile", default=None, help="병원 프로파일 JSON(없으면 기본 양식)")
+        s.add_argument("--spec", default=None, help="인계 명세 JSON. 생략 시 같은 폴더의 nicu_daily_handoff_spec.json 자동 사용, none 이면 사용 안 함")
         s.add_argument("--cohort", default="nicu", choices=["nicu", "all"], help="all = 전체 ICU(코드 점검용)")
         s.add_argument("--out", default="out")
         s.add_argument("--stay", default=None)
