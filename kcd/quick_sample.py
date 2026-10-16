@@ -119,6 +119,6 @@ print("적격 환아 %d명 중 %d명 추출 → %s" % (len(persons), len(df), a.
 cmd = os.path.splitext(a.out)[0] + "_commands.sh"
 with open(cmd, "w", encoding="utf-8") as f:
     for _, x in df.iterrows():
-        f.write("python kcd_nicu.py run --data %s --stay %s --day %d --out generated_quick\n" % (x["data_dir"], x["stay_id"], x["kcd_day"]))
+        f.write("python kcd_nicu.py run --data %s --stay %s --day %d --out generated_quick --mode ${KCD_MODE:-template}\n" % (x["data_dir"], x["stay_id"], x["kcd_day"]))
 print("문서 생성 명령: bash %s" % cmd)
 print("주의: 결과 파일에는 person_id·날짜가 있으므로 분석환경 밖으로 반출하지 마세요.")

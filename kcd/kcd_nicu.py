@@ -17,6 +17,7 @@ kcd_nicu.py — K-MIMIC 형식 데이터로 NICU 1일 요약지(의료진용)와
   python kcd_nicu.py init-profile  --out my_hospital.json              # 병원 프로파일 초안
   python kcd_nicu.py profile-check --data DIR --profile my_hospital.json   # 항목별 데이터 자동 채움 비율
   python kcd_nicu.py evaluate-note --data DIR --stay 123 --day 2 --note note.txt --doc summary|parent
+  python kcd_nicu.py train-risk    --data "DIR/*" --out risk_models   # 트리 모델 2종 학습(악화 조기경보, 검사치 임계치)
   python kcd_nicu.py sample        --data "DIR/*" --n 30 --seed 0 --out sample [--stratify]   # 생후 28일 이하 평가 시점 무작위 추출(여러 폴더 가능)
 
 공통 옵션: --profile 병원.json, --cohort nicu|all(all = 전체 ICU, 코드 점검용), --time-unit D|h|min
@@ -633,45 +634,43 @@ DEFAULT_PROFILE = {
             ],
         },
         "parent": {
-            "title": "오늘 아기의 하루 (부모님 설명지)",
-            "notice": "이 설명지는 진료 기록을 바탕으로 자동 작성된 초안이며, 담당 의료진이 확인한 뒤 전달합니다.",
-            "sections": [{"id": "P1", "title": "오늘 아기의 상태"}, {"id": "P2", "title": "숨쉬기"}, {"id": "P3", "title": "먹는 양과 몸무게"},
-                         {"id": "P4", "title": "소변과 대변"}, {"id": "P5", "title": "오늘 받은 검사와 처치"}, {"id": "P6", "title": "사용 중인 약"},
-                         {"id": "P7", "title": "의료진이 살펴보고 있는 점"}, {"id": "P8", "title": "궁금하신 점이 있으면"}],
-            "cdss_section": "P7",
-            "closing_section": "P8",
-            "section_of": {"patient_info": "P1", "resp_support": "P2", "resp_change": "P2", "neo_events": "P2", "weight": "P3", "intake_24h": "P3",
-                           "urine_24h": "P4", "stool": "P4", "lab_latest": "P5", "lab_normal": "P5", "lab_change": "P5", "lab_none": "P5",
-                           "procedure": "P5", "imaging": "P5", "micro_pending": "P5", "micro_positive": "P5", "micro_negative": "P5", "crrt_episode": "P5",
-                           "med_active": "P6", "med_stopped": "P6", "infusion_episode": "P6", "fluids": "P6"},
+            "title": "오늘 아이의 상태와 돌봄",
+            "subtitle": "보호자 Daily Briefing · 간호 인계 기록을 바탕으로 쉽게 정리한 자료",
+            "notice": "간호사가 내용을 확인한 뒤 설명과 함께 전달합니다. 보호자에게 자동으로 보내지 않습니다.",
+            "sections": [{"id": "B1", "title": "오늘 꼭 알아둘 변화"}, {"id": "B2", "title": "현재 받고 있는 치료와 돌봄"},
+                         {"id": "B3", "title": "아직 확인이 필요한 중요한 내용"}, {"id": "B4", "title": "기록된 다음 계획"},
+                         {"id": "B5", "title": "보호자가 질문할 내용"}],
+            "cdss_section": "B3",
+            "closing_section": "B5",
+            "section_of": {"resp_change": "B1", "neo_events": "B1", "procedure": "B1", "imaging": "B1", "micro_positive": "B1", "crrt_episode": "B1",
+                           "lab_latest": "B1", "resp_support": "B2", "weight": "B2", "feeding_24h": "B2", "intake_24h": "B2", "med_active": "B2",
+                           "infusion_episode": "B2", "fluids": "B2", "micro_pending": "B3"},
             "show_lab_values": False,
             "parent_visible_rules": ["NEO_HYPOGLYCEMIA", "NEO_HYPERGLYCEMIA", "NEO_BILI_HIGH", "NEO_BILI_RISE", "NEO_TEMP_INSTABILITY",
                                      "NEO_WEIGHT_LOSS", "NEO_SEPSIS_MARKERS", "NEO_OLIGURIA"],
             "alert_text": {
-                "NEO_HYPOGLYCEMIA": "혈당이 낮게 측정된 적이 있어 의료진이 혈당을 자주 확인하고 있습니다.",
-                "NEO_HYPERGLYCEMIA": "혈당이 높게 측정된 적이 있어 의료진이 혈당을 확인하고 있습니다.",
-                "NEO_BILI_HIGH": "황달 수치(빌리루빈)가 높게 나와 의료진이 치료가 필요한지 확인하고 있습니다.",
-                "NEO_BILI_RISE": "황달 수치(빌리루빈)가 빠르게 오르고 있어 의료진이 자주 확인하고 있습니다.",
-                "NEO_TEMP_INSTABILITY": "체온이 정상 범위를 벗어난 적이 있어 체온을 자주 확인하고 있습니다.",
-                "NEO_WEIGHT_LOSS": "입원했을 때보다 몸무게가 많이 줄어 먹는 양을 함께 살펴보고 있습니다.",
-                "NEO_SEPSIS_MARKERS": "감염이 있는지 확인하기 위한 검사 결과를 살펴보고 있습니다.",
-                "NEO_OLIGURIA": "소변 양이 적어 의료진이 수분 공급을 살펴보고 있습니다.",
+                "NEO_HYPOGLYCEMIA": "혈당이 낮게 나온 적이 있어서 간호사와 의사가 혈당을 자주 재고 있습니다.",
+                "NEO_HYPERGLYCEMIA": "혈당이 높게 나온 적이 있어서 간호사와 의사가 혈당을 살펴보고 있습니다.",
+                "NEO_BILI_HIGH": "황달 수치가 높게 나와서 치료가 필요한지 의사가 살펴보고 있습니다.",
+                "NEO_BILI_RISE": "황달 수치가 빠르게 올라서 의사가 자주 확인하고 있습니다.",
+                "NEO_TEMP_INSTABILITY": "체온이 정해진 범위를 벗어난 적이 있어서 체온을 자주 재고 있습니다.",
+                "NEO_WEIGHT_LOSS": "입원했을 때보다 몸무게가 많이 줄어서 먹는 양을 함께 살펴보고 있습니다.",
+                "NEO_SEPSIS_MARKERS": "감염이 있는지 알아보는 검사 결과를 살펴보고 있습니다.",
+                "NEO_OLIGURIA": "소변 양이 적어서 몸에 들어가는 물의 양을 살펴보고 있습니다.",
             },
-            "empty_text": "오늘 기록에서 따로 말씀드릴 내용은 없습니다.",
-            "gap_text": "{label}: 오늘 기록에서는 확인되지 않았습니다. 궁금하시면 담당 의료진에게 물어봐 주세요.",
-            "closing": ["궁금한 점은 면회나 전화 상담 때 담당 의료진에게 편하게 물어봐 주세요.",
-                        "아기의 상태는 하루 중에도 바뀔 수 있어, 자세한 설명은 담당 의료진이 직접 드립니다."],
+            "gap_text": "오늘 기록에서는 {label} 내용이 확인되지 않았습니다.",
+            "questions": ["오늘 설명에서 더 알고 싶은 점이 있으신가요?",
+                          "아이에게 지금 가장 중요한 치료가 무엇인지 궁금하시면 물어봐 주세요.",
+                          "다음에 무엇을 확인하는지, 언제 다시 설명을 들을 수 있는지도 물어보실 수 있습니다."],
+            "doctor_flag": {"dx_regex": "^P36|^A4[01]|^P77|^P52|^P91|^P29|^Q2[0-5]|^C[0-9]", "alert_severity": ["high"], "severity_levels": ["불안정"],
+                            "fact_types": ["micro_positive"]},
             "checklist": [
-                _ck("p_day", "입원 일수", "P1", True, [_f("patient_info")]),
-                _ck("p_resp", "숨쉬기", "P2", True, [_f("resp_support", "resp_change")], mention_regex="숨|호흡|인공호흡기|산소"),
-                _ck("p_events", "숨 멈춤·느린 맥박", "P2", False, [_f("neo_events", status="present")], mention_regex="산소포화도|심장 박동|숨 멈춤"),
-                _ck("p_weight", "몸무게", "P3", True, [_f("weight")], mention_regex="몸무게|체중"),
-                _ck("p_feeding", "먹는 양", "P3", True, [_f("intake_24h")], mention_regex="먹|수유|영양|수분"),
-                _ck("p_output", "소변과 대변", "P4", False, [_f("urine_24h", "stool")], mention_regex="소변|대변"),
-                _ck("p_tests", "오늘 받은 검사", "P5", True,
-                    [_f("lab_latest", "lab_normal", "lab_change", "lab_none", "imaging", "procedure", "micro_pending", "micro_positive", "micro_negative")],
-                    mention_regex="검사"),
-                _ck("p_meds", "사용 중인 약", "P6", True, [_f("med_active", "fluids", "infusion_episode")], mention_regex="약|주사|수액"),
+                _ck("p_resp", "숨 쉬기", "B2", True, [_f("resp_support", "resp_change")], mention_regex="숨|호흡|인공호흡기|산소"),
+                _ck("p_events", "산소 수치 저하·느린 맥박", "B1", False, [_f("neo_events", status="present")], mention_regex="산소 수치|심장"),
+                _ck("p_weight", "몸무게", "B2", True, [_f("weight")], mention_regex="몸무게|체중"),
+                _ck("p_feeding", "먹는 양", "B2", True, [_f("feeding_24h", "intake_24h")], mention_regex="먹|수유|영양|수분"),
+                _ck("p_tests", "중요한 검사 변화", "B1", False, [_f("lab_latest", "micro_positive", "procedure", "imaging")], mention_regex="검사"),
+                _ck("p_meds", "쓰고 있는 약", "B2", True, [_f("med_active", "fluids", "infusion_episode")], mention_regex="약|주사|수액"),
             ],
         },
     },
@@ -1792,6 +1791,7 @@ def course24_facts(ctx):
             reported = pd.notna(ts) and ts <= ctx.t0
             in_win = tc > ctx.win_start or (reported and ts > ctx.win_start)
             orgs = [o for o in g.get("org_name", pd.Series(dtype=str)).dropna().astype(str).unique() if o not in ("nan", "")]
+            orgs = [o for o in orgs if not re.search(NEG_ORG_RX, o, re.I)]  # 'No MRSA isolated' 같은 음성 문구는 균 동정이 아님
             if orgs and reported:
                 res = g[g["interpretation"].astype(str).isin(["R"])]["ab_name"].dropna().astype(str).unique().tolist() if "interpretation" in g.columns else []
                 txt = "%s(%s 채취) 배양 %s 동정%s, 보고 %s%s." % (spec, fmt_t(tc), ", ".join(orgs), ("; 내성: " + ", ".join(res)) if res else "", fmt_t(ts), "" if in_win else "(이전 보고)")
@@ -2091,6 +2091,8 @@ def lab_facts(ctx):
 
 NOT_GIVEN_RX = r"not given|held|hold|보류|미투여|refus|거부|missed|omitted|delay|지연|투여 ?안 ?함"
 
+NEG_ORG_RX = r"^\s*no\b|not isolated|no growth|negative|음성|자라지 않|무균|없음"
+
 CLS_KO = {"vasopressor": "승압·강심제", "sedation": "진정·진통제", "insulin": "인슐린", "anticoagulant": "항응고제", "antiplatelet": "항혈소판제",
           "antibiotic": "항생제", "antifungal": "항진균제", "diuretic": "이뇨제", "respiratory_stimulant": "호흡자극제", "surfactant": "폐표면활성제",
           "nutrition": "영양", "anticonvulsant": "항경련제"}
@@ -2281,7 +2283,7 @@ def run_cdss(ctx, facts, dur_pairs=None):
             if rule == k or rule.startswith(k):
                 sev = v
         alerts.append({"alert_id": "AL%02d" % (len(alerts) + 1), "rule_id": rule, "severity": sev, "title": title, "text": text,
-                       "trigger_fact_ids": [t for t in trig if t], "reference": ref, "parent_visible": rule in vis})
+                       "trigger_fact_ids": [t for t in trig if t], "reference": ref, "parent_visible": rule in vis, "action": cdss_action(rule)})
 
     N = PROFILE["neonatal"]
     H = HH(ctx)
@@ -2591,45 +2593,254 @@ def lay_labs(facts, show_values):
     return [(s, [f.fid for f in labs if f.ftype != "lab_none"])]
 
 
+# ---- 보호자 Daily Briefing(부모님 요약지): 간호 인계 fact(SSOT)에서 보호자에게 필요한 사실만 쉬운 말로. 숫자는 fact 값 그대로.
+PB = {
+    "opening": "%s 기준으로 확인된 내용을 말씀드리겠습니다.",
+    "r_inv": "아이는 숨 쉬는 것을 돕는 기계(인공호흡기)를 쓰고 있습니다.",
+    "r_niv": "아이는 코로 공기를 넣어 숨 쉬기를 도와주는 장치를 쓰고 있습니다.",
+    "r_o2": "아이는 코에 연결된 줄로 산소를 받고 있습니다.",
+    "r_none": "최근 기록에서는 숨 쉬기를 돕는 장치를 쓴 기록이 확인되지 않았습니다.",
+    "r_change": "오늘 숨 쉬기를 돕는 방법이 바뀌었습니다.",
+    "ev_desat": "오늘 산소 수치가 잠깐 낮아진 적이 %d번 있었습니다.",
+    "ev_brady": "심장이 잠깐 느리게 뛴 적은 %d번 있었습니다.",
+    "w_cur": "아이 몸무게는 %s %s입니다.",
+    "w_prev": "어제 잰 몸무게는 %s %s이었습니다.",
+    "fd_tube": "아이는 위로 연결된 관으로 먹고 있습니다.",
+    "fd_oral": "아이는 입으로 먹고 있습니다.",
+    "fd_both": "아이는 입과 위로 연결된 관으로 먹고 있습니다.",
+    "fd_amount": "지난 하루 동안 %d번, 모두 %s mL를 먹었습니다.",
+    "fd_none": "오늘 기록에서는 입이나 관으로 먹은 기록이 확인되지 않았습니다.",
+    "fd_iv": "수분과 영양은 주사로 받고 있습니다.",
+    "meds": "지금 %s 쓰고 있습니다.",
+    "meds_more": "그 밖에 필요한 약과 영양제도 쓰고 있습니다.",
+    "fluid": "수액도 맞고 있습니다.",
+    "photo": "빛을 쬐는 치료(광선치료)를 받고 있습니다.",
+    "lab_high": "피검사에서 %s 기준보다 높게 나왔습니다.",
+    "lab_low": "피검사에서 %s 기준보다 낮게 나왔습니다.",
+    "proc": "오늘 %s 했습니다.",
+    "mpos": "균 검사 결과가 나왔습니다. 자세한 내용은 담당 의사에게 들으실 수 있습니다.",
+    "mpend": "감염이 있는지 알아보는 검사 결과를 아직 기다리고 있습니다.",
+    "crrt": "콩팥 기능을 돕는 투석 치료를 받았습니다.",
+    "plan": "다음 계획으로 '%s' 내용이 기록되어 있습니다.",
+}
+PB_LAB = {"tbil": "황달 수치", "glucose": "혈당", "bst": "혈당", "crp": "염증 수치", "na": "나트륨(몸속 소금 성분)", "k": "칼륨", "hb": "빈혈 수치",
+          "plt": "혈소판", "wbc": "백혈구", "anc": "백혈구", "cr": "콩팥 기능 수치", "bun": "콩팥 기능 수치", "ph": "혈액 산도", "pco2": "혈액 이산화탄소",
+          "lactate": "젖산", "ica": "칼슘", "mg": "마그네슘", "phos": "인", "albumin": "알부민", "ast": "간 수치", "alt": "간 수치"}
+PB_CLASS = {"vasopressor": "혈압과 심장을 돕는 약", "sedation": "편안하게 해 주는 약", "insulin": "혈당을 조절하는 약", "anticoagulant": "피가 굳지 않게 하는 약",
+            "antibiotic": "감염을 막거나 치료하는 항생제", "antifungal": "곰팡이 감염을 치료하는 약", "diuretic": "소변이 잘 나오게 하는 약",
+            "respiratory_stimulant": "숨 멈춤을 줄여 주는 약", "surfactant": "폐가 잘 펴지게 돕는 약", "nutrition": "주사로 주는 영양",
+            "anticonvulsant": "경련을 막는 약", "antiplatelet": "피가 덜 뭉치게 하는 약"}
+
+
+def _josa_list(names, pair="을를"):
+    names = list(dict.fromkeys(names))
+    if not names:
+        return ""
+    body = ", ".join(names[:-1]) + (", " if len(names) > 1 else "") + names[-1]
+    return josa(body, pair)
+
+
+def ssot_id(ctx, facts):
+    base = {"stay": ctx.stay_id, "t0": str(ctx.t0), "facts": [f.text for f in facts if f.ftype not in ("parent_gap",)],
+            "spec": (PROFILE.get("_spec") or {}).get("version"), "profile": PROFILE.get("profile_name"), "code": VERSION}
+    return sha(base)
+
+
+def doctor_flags(ctx, facts, alerts):
+    """보호자에게 직접 설명하지 않고 진료팀 설명이 필요하다고 간호사에게 표시할 항목."""
+    R = PROFILE["documents"]["parent"].get("doctor_flag", {})
+    out = []
+    rx = R.get("dx_regex")
+    for f in facts:
+        if f.ftype in ("diagnosis_main", "diagnosis_other") and rx:
+            codes = [c for c in re.findall(r"\b[A-Z]\d{2,4}\b", f.text) if re.search(rx, c)]
+            if codes:
+                out.append(("중대한 진단 코드(%s)" % ", ".join(codes), [f.fid]))
+        if f.ftype in R.get("fact_types", []):
+            out.append(("%s" % f.text[:60], [f.fid]))
+        if f.ftype == "severity" and f.status in R.get("severity_levels", []):
+            out.append(("중증도 %s" % f.status, [f.fid]))
+        if f.ftype == "lab_latest" and f.extra.get("critical"):
+            out.append(("검사 위험값: %s" % f.text[:50], [f.fid]))
+    for a in alerts:
+        if a["severity"] in R.get("alert_severity", []):
+            out.append(("고위험 알림: %s" % a["title"], a["trigger_fact_ids"]))
+    seen, res = set(), []
+    for t, ids in out:
+        if t not in seen:
+            seen.add(t)
+            res.append((t, ids))
+    return res
+
+
 def render_parent(ctx, facts, alerts):
+    """보호자 브리핑 = 문장 리스트(section, text, cites). 근거 없는 묶음은 비움."""
     P = PROFILE["documents"]["parent"]
     smap = P.get("section_of", {})
     secs = list(PARENT_SECTIONS.keys())
-    psec, csec = P.get("cdss_section", "P7"), P.get("closing_section", "P8")
+    psec, csec = P.get("cdss_section", "B3"), P.get("closing_section", "B5")
     by = OrderedDict((s, []) for s in secs)
-    first = secs[0]
+
+    def put(sec, text, fids):
+        if sec in by and text:
+            by[sec].append({"section": sec, "text": "%s [%s]" % (text, ", ".join(dict.fromkeys(fids))), "cites": list(dict.fromkeys(fids))})
+    F = {}
     for f in facts:
-        s = f.section if f.ftype == "parent_gap" else smap.get(f.ftype)
-        if s not in by or f.ftype in ("lab_latest", "lab_change", "lab_normal", "lab_none", "bst_24h"):
-            continue
-        txt = lay_sentence(ctx, f)
-        if txt:
-            by[s].append({"section": s, "text": "%s [%s]" % (txt, f.fid), "cites": [f.fid]})
-    lsec = smap.get("lab_latest", "P5")
-    if lsec in by:
-        for txt, cites in lay_labs(facts, P.get("show_lab_values", False)):
-            by[lsec].insert(0, {"section": lsec, "text": "%s [%s]" % (txt, ", ".join(cites)), "cites": cites})
-    if first in by:
-        by[first].append({"section": first, "text": LAY_T["intro"], "cites": [], "fixed": True})
+        F.setdefault(f.ftype, []).append(f)
+    # 오늘 꼭 알아둘 변화
+    for f in F.get("resp_change", []):
+        put(smap.get("resp_change"), PB["r_change"], [f.fid])
+    for f in F.get("neo_events", []):
+        if f.status == "present":
+            t = PB["ev_desat"] % f.extra["n_desat"] if f.extra.get("n_desat") else ""
+            if f.extra.get("n_brady"):
+                t = (t + " " if t else "") + PB["ev_brady"] % f.extra["n_brady"]
+            put(smap.get("neo_events"), t, [f.fid])
+    labs = [f for f in F.get("lab_latest", [])]
+    for hi, key in ((True, "lab_high"), (False, "lab_low")):
+        g = [f for f in labs if bool(f.extra.get("high")) == hi]
+        names = [PB_LAB.get(f.extra.get("concept"), LAB_DISPLAY.get(f.extra.get("concept"), f.extra.get("concept"))) for f in g]
+        if g:
+            put(smap.get("lab_latest"), PB[key] % _josa_list(names, "이가"), [f.fid for f in g])
+    for f in F.get("procedure", []) + F.get("imaging", []):
+        names = [lay_proc(n) for n in (f.extra.get("names") or [f.extra.get("label", "")])]
+        put(smap.get(f.ftype), PB["proc"] % _josa_list(names, "을를"), [f.fid])
+    for f in F.get("micro_positive", []):
+        if f.salience >= 3:
+            put(smap.get("micro_positive"), PB["mpos"], [f.fid])
+    for f in F.get("crrt_episode", []):
+        put(smap.get("crrt_episode"), PB["crrt"], [f.fid])
+    # 현재 받고 있는 치료와 돌봄
+    for f in F.get("resp_support", []):
+        k = f.extra.get("kind")
+        t = PB["r_inv"] if k in ("invasive", "vent_unknown") else PB["r_niv"] if k == "noninvasive" else PB["r_o2"] if k == "o2" else PB["r_none"]
+        put(smap.get("resp_support"), t, [f.fid])
+    photo = [f for f in facts if f.ftype == "checklist_item" and re.search(r"광선|photo", f.text, re.I)]
+    if photo:
+        put(smap.get("resp_support", "B2"), PB["photo"], [f.fid for f in photo[:2]])
+    fd, it = (F.get("feeding_24h") or [None])[0], (F.get("intake_24h") or [None])[0]
+    if fd:
+        route = PB["fd_both"] if ("경구" in fd.text and "경관" in fd.text) else PB["fd_tube"] if "경관" in fd.text else PB["fd_oral"]
+        put(smap.get("feeding_24h"), route + " " + PB["fd_amount"] % (fd.extra["n"], fmt_num(fd.extra["total"])), [fd.fid] + ([it.fid] if it else []))
+    elif it:
+        put(smap.get("intake_24h"), PB["fd_none"] + (" " + PB["fd_iv"] if it.extra.get("iv") else ""), [it.fid])
+    for f in F.get("weight", []):
+        e = f.extra
+        t = PB["w_cur"] % (fmt_num(e["cur"]), e.get("unit", "g"))
+        if "prev" in e:
+            t += " " + PB["w_prev"] % (fmt_num(e["prev"]), e.get("unit", "g"))
+        put(smap.get("weight"), t, [f.fid])
+    act = [f for f in F.get("med_active", []) + F.get("infusion_episode", []) if f.status == "active"]
+    if act:
+        names = [PB_CLASS[f.extra.get("cls")] for f in act if f.extra.get("cls") in PB_CLASS]
+        other = [f for f in act if f.extra.get("cls") not in PB_CLASS]
+        t = (PB["meds"] % _josa_list(names, "을를")) if names else ""
+        if other:
+            t = (t + " " if t else "") + PB["meds_more"]
+        if F.get("fluids"):
+            t += " " + PB["fluid"]
+        put(smap.get("med_active"), t.strip(), [f.fid for f in act] + [f.fid for f in F.get("fluids", [])])
+    elif F.get("fluids"):
+        put(smap.get("fluids"), PB["fluid"], [f.fid for f in F["fluids"]])
+    # 아직 확인이 필요한 중요한 내용
+    if F.get("micro_pending"):
+        put(smap.get("micro_pending"), PB["mpend"], [f.fid for f in F["micro_pending"]])
     lay = P.get("alert_text", {})
     seen = set()
     for a in alerts:
         r = a["rule_id"]
-        if a.get("parent_visible") and r in lay and r not in seen and psec in by:
+        if a.get("parent_visible") and r in lay and r not in seen:
             seen.add(r)
-            by[psec].append({"section": psec, "text": "%s [%s]" % (lay[r], ", ".join(a["trigger_fact_ids"])), "cites": list(a["trigger_fact_ids"])})
+            put(psec, lay[r], a["trigger_fact_ids"])
+    for f in F.get("parent_gap", []):
+        put(psec, f.text, [f.fid])
+    # 기록된 다음 계획: 기록에 계획·예정 항목이 있을 때만
+    for f in facts:
+        if f.ftype == "checklist_item" and re.search(r"예정|계획|plan", f.text, re.I) and not re.search(r"광선|photo", f.text, re.I):
+            body = f.text.split(":", 1)[-1].strip().rstrip(".")
+            put("B4" if "B4" in by else psec, PB["plan"] % body[:60], [f.fid])
+    sents = []
     for s in secs:
         if s == csec:
-            by[s] = [{"section": s, "text": t, "cites": [], "fixed": True} for t in P.get("closing", [])]
-        elif not by[s]:
-            by[s].append({"section": s, "text": P.get("empty_text", "오늘 기록에서 따로 말씀드릴 내용은 없습니다."), "cites": [], "fixed": True})
-    sents = [x for s in secs for x in by[s]]
+            sents += [{"section": s, "text": q, "cites": [], "fixed": True} for q in P.get("questions", [])]
+        else:
+            sents += by[s]
     for i, x in enumerate(sents, 1):
         x["sid"] = "S%03d" % i
     return sents
 
 
-def note_markdown(ctx, sents, verdicts=None, coverage=None, title=None, checklist=None, doc="summary", show_cites=True, extra_metrics=None):
+def _kor_time(t):
+    t = pd.Timestamp(t)
+    h = t.hour
+    return "%d월 %d일 %s %d시%s" % (t.month, t.day, "오전" if h < 12 else "오후", h if h <= 12 else h - 12, (" %d분" % t.minute) if t.minute else "")
+
+
+def parent_markdown(ctx, sents, facts=None, alerts=None, verdicts=None, coverage=None, nurse=False, sid_=None, metrics_=None):
+    """보호자용(nurse=False): 불렛 없이 묶음별 문단. 간호사 확인용(nurse=True): 문장별 근거·확인할 부분·진료팀 설명 필요 항목."""
+    P = PROFILE["documents"]["parent"]
+    hrs = (ctx.t0 - ctx.win_start).total_seconds() / 3600.0
+    rng = "지난 24시간" if hrs >= 23.5 else "입실 후 %s시간" % fmt_num(round(hrs))
+    clean = [x for x in sents if x["section"] in PARENT_SECTIONS]
+    if not nurse:
+        L = ["# " + P["title"], "", "%s 기준 · 범위: %s" % (_kor_time(ctx.t0), rng), "", PB["opening"] % _kor_time(ctx.t0).split(" ", 2)[-1], ""]
+        for s, title in PARENT_SECTIONS.items():
+            body = " ".join(_strip_cites(x["text"]) for x in clean if x["section"] == s)
+            if body:
+                L += ["## " + title, "", body, ""]
+        L += ["---", "", "%s 간호사 확인 전 초안입니다. 기준 자료 ID %s" % (P.get("notice", ""), sid_ or "-")]
+        return "\n".join(L) + "\n"
+    vd = {v["sid"]: v for v in (verdicts or [])}
+    FF = {f.fid: f for f in (facts or [])}
+    flags = doctor_flags(ctx, facts or [], alerts or [])
+    flag_ids = {i for _, ids in flags for i in ids}
+    L = ["# 보호자 브리핑 간호사 확인용", "", "- 기준 자료 ID: %s (인계 자료가 바뀌면 다시 생성해야 하며, 이전 브리핑은 사용 중지로 바뀜)" % (sid_ or "-"),
+         "- 기준 시각 %s, 범위 %s, stay %s" % (fmt_t(ctx.t0), rng, ctx.stay_id), "- 상태: 간호사 확인 전 초안. 보호자 자동 발송 안 함", ""]
+    L += ["## 진료팀 설명이 필요한 항목", ""]
+    L += (["- %s [%s]" % (t, ", ".join(ids)) for t, ids in flags] or ["- 해당 없음"])
+    L += ["", "## 문장별 근거와 확인할 부분", "", "| 번호 | 묶음 | 보호자용 문장 | 근거 원문 | 자동 대조 | 확인할 부분 |", "|---|---|---|---|---|---|"]
+    for x in clean:
+        v = vd.get(x["sid"], {})
+        src = " / ".join("%s: %s" % (c, FF[c].text[:90]) for c in x.get("cites", []) if c in FF) or ("고정 문구" if x.get("fixed") else "-")
+        chk = []
+        if v.get("label") not in (None, "Supported"):
+            chk.append("%s: %s" % (v["label"], v.get("reason", "")))
+        if extract_nums(x["text"]):
+            chk.append("수치 확인")
+        if set(x.get("cites", [])) & flag_ids:
+            chk.append("진료팀 설명 필요")
+        L.append("| %s | %s | %s | %s | %s | %s |" % (x["sid"], PARENT_SECTIONS.get(x["section"], ""), _strip_cites(x["text"]).replace("|", "/"),
+                                                   src.replace("|", "/"), "근거 일치" if v.get("label") == "Supported" else (v.get("label") or "-"),
+                                                   "; ".join(chk) or "-"))
+    used = {c for x in clean for c in x.get("cites", [])}
+    left = [f for f in (facts or []) if f.salience >= 3 and f.fid not in used and f.ftype not in ("checklist_gap", "parent_gap")]
+    L += ["", "## 보호자 문서에서 뺀 중요 정보(전달 여부 판단)", ""] + (["- %s: %s" % (f.fid, f.text[:100]) for f in left] or ["- 없음"])
+    if coverage is not None:
+        miss = [c for c in coverage if c["status"] != "Covered"]
+        L += ["", "## 자동 대조 요약", "", "- 문장 %d개 중 근거 일치 %d개" % (len(vd), sum(1 for v in vd.values() if v["label"] == "Supported")),
+              "- 필수 항목 누락·부분 전달 %d건" % len(miss)]
+        if metrics_:
+            L.append("- 문장 평균 %s자, 최장 %s자" % (metrics_.get("read_avg_chars"), metrics_.get("read_max_chars")))
+    return "\n".join(L) + "\n"
+
+
+def supersede(path, new_id):
+    """같은 경로에 다른 기준 자료 ID로 만든 브리핑이 있으면 '사용 중지' 이름으로 바꿔 재사용을 막음."""
+    if not os.path.exists(path):
+        return None
+    old = open(path, encoding="utf-8").read()
+    m = re.search(r"기준 자료 ID:? ([0-9a-f]{6,})", old)
+    if m and m.group(1) != new_id:
+        dst = path.replace(".md", ".SUPERSEDED_%s.md" % m.group(1))
+        os.replace(path, dst)
+        return dst
+    return None
+
+
+def note_markdown(ctx, sents, verdicts=None, coverage=None, title=None, checklist=None, doc="summary", show_cites=True, extra_metrics=None,
+                  facts=None, alerts=None, sid_=None):
+    if doc == "parent" and title is None:
+        return parent_markdown(ctx, sents, facts, alerts, verdicts, coverage, nurse=show_cites, sid_=sid_, metrics_=extra_metrics)
     D = PROFILE["documents"][doc]
     title = title or D["title"]
     secmap = SECTIONS if doc == "summary" else PARENT_SECTIONS
@@ -2694,23 +2905,30 @@ class LLM(object):
 
     def chat(self, system, user, temperature=0.0, max_tokens=1500):
         import urllib.request
+        max_tokens = int(os.environ.get("KCD_LLM_MAX_TOKENS", 0)) or max_tokens   # 추론(thinking) 모델은 크게(예: 8000)
         body = json.dumps({"model": self.model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                            "temperature": temperature, "max_tokens": max_tokens}).encode("utf-8")
         req = urllib.request.Request(self.base.rstrip("/") + "/chat/completions", data=body,
                                      headers={"Content-Type": "application/json", "Authorization": "Bearer " + self.key})
         with urllib.request.urlopen(req, timeout=300) as r:
             out = json.loads(r.read().decode("utf-8"))
-        return out["choices"][0]["message"]["content"]
+        txt = out["choices"][0]["message"].get("content") or ""
+        # 추론 모델의 <think>…</think> 는 버림(안의 '- ' 줄이 인계 문장으로 섞이지 않도록). 닫는 태그가 없으면(잘림) 빈 응답 취급
+        if "<think>" in txt or "</think>" in txt:
+            txt = txt.split("</think>", 1)[1] if "</think>" in txt else ""
+        return txt.strip()
 
 
 SYS_GROUNDED = ("당신은 NICU 환아의 1일 요약지를 작성하는 보조자다. 주어진 facts만 사용한다.\n"
                 "규칙: 1) facts에 없는 정보·추정·권고를 쓰지 않는다 2) 문장마다 끝에 사용한 fact_id를 [F001] 형식으로 인용한다\n"
                 "3) 수치·단위·시각(MM-DD HH:MM)은 fact 표기를 그대로 복사한다 4) 개조식(~함/~임)으로 쓴다\n"
                 "5) 출력은 '- '로 시작하는 문장 목록만 쓴다. 제목·설명은 쓰지 않는다.")
-SYS_PARENT = ("당신은 NICU에 입원한 아기의 부모님께 오늘 상태를 설명하는 글을 쓰는 보조자다. 주어진 facts만 사용한다.\n"
-              "규칙: 1) facts에 없는 정보, 예후, 추측, 약속을 쓰지 않는다 2) 쉬운 우리말로, 한 문장은 60자 안팎으로 쓴다\n"
-              "3) 의학 용어·약어는 괄호 안에 두고 쉬운 말을 먼저 쓴다 4) 숫자는 facts의 값을 그대로 쓰고, 검사 수치는 쓰지 않는다\n"
-              "5) 존댓말(~습니다)로 쓴다 6) 문장마다 끝에 사용한 fact_id를 [F001] 형식으로 인용한다 7) '- '로 시작하는 문장 목록만 쓴다.")
+SYS_PARENT = ("당신은 간호 인계 기록(facts)을 바탕으로 간호사가 보호자에게 오늘 아이 상태를 설명할 때 쓸 자료를 쓰는 보조자다.\n"
+              "규칙: 1) 초등학교 6학년도 이해할 쉬운 한국어, 존댓말(~습니다), 한 문장은 짧게 2) 1~2분 안에 말할 분량\n"
+              "3) 전문용어·불필요한 수치는 줄이되 중요한 악화나 불확실성은 빼지 않는다\n"
+              "4) facts에 없는 진단·원인·예후·안심 표현을 만들지 않는다. 수치·단위·시간과 실제 투여 여부를 바꾸지 않는다\n"
+              "5) '기록 없음'을 '정상'·'미투여'·'결과 대기'로 바꾸지 않는다 6) 문장마다 끝에 fact_id를 [F001] 형식으로 인용한다\n"
+              "7) '- '로 시작하는 문장 목록만 쓴다.")
 
 
 def parse_bullets(text):
@@ -2925,6 +3143,7 @@ def parent_lex():
     """부모님 설명지 어휘(쉬운 말 템플릿·병원 프로파일 문구). 이 어휘 밖 표현은 근거 확인 대상."""
     P = PROFILE["documents"]["parent"] if PROFILE else {}
     texts = list(LAY_T.values()) + list(LAY_CLASS.values()) + list(LAY_LAB.values()) + [v for _, v in LAY_PROC]
+    texts += list(PB.values()) + list(PB_LAB.values()) + list(PB_CLASS.values()) + list(P.get("questions", [])) + [P.get("subtitle", "")]
     texts += list(P.get("alert_text", {}).values()) + list(P.get("closing", [])) + [P.get("empty_text", ""), P.get("gap_text", ""), P.get("notice", "")]
     texts += [c.get("gap_text", "") + " " + c.get("label", "") for c in P.get("checklist", [])]
     return set(re.findall(r"[A-Za-z][A-Za-z0-9\-]{2,}|[가-힣]{2,}", " ".join(texts)))
@@ -2966,7 +3185,7 @@ class Verifier(object):
     def mentions(self, text, with_chk=False, cited=None):
         t = CITE_RX.sub(" ", text)
         if self.doc == "parent":  # 쉬운 말 약효 설명(예: '혈압과 심장 기능을 돕는 약')은 측정값 언급이 아님
-            for ph in LAY_CLASS.values():
+            for ph in list(LAY_CLASS.values()) + list(PB_CLASS.values()):
                 t = t.replace(ph, " ")
             for c in (cited or ()):  # 인용한 검사의 쉬운 말 이름(예: '백혈구(호중구)')은 그 검사 언급으로 처리
                 if c in LAY_LAB:
@@ -3091,6 +3310,10 @@ class Verifier(object):
         for t in toks:
             if t in src_toks or t in self.lex or t.lower() in self.med_names:
                 continue
+            if self.doc == "parent" and re.match(r"[가-힣]", t):
+                core = re.sub(r"(을|를|이|가|은|는|도|와|과|로|으로|에|에서|의)$", "", t)
+                if len(core) < 2 or core in self.lex:
+                    continue
             if re.match(r"[가-힣]", t) and (t[:2] in src_stems or t[:-1] in self.lex or t[:-2] in self.lex or t.rstrip("함임됨음") in self.lex):
                 continue
             if re.match(r"[A-Za-z]", t) and t.upper() in ("HIGH", "MEDIUM", "LOW", "INFO"):
@@ -3127,7 +3350,8 @@ class Verifier(object):
                 continue
             keys = f.key_nums
             if self.doc == "parent":
-                hide = f.ftype in ("lab_latest", "lab_change", "lab_normal", "bst_24h") and not PROFILE["documents"]["parent"].get("show_lab_values")
+                hide = (f.ftype in ("lab_latest", "lab_change", "lab_normal", "bst_24h") and not PROFILE["documents"]["parent"].get("show_lab_values")) \
+                    or f.ftype == "intake_24h"
                 keys = [] if hide else f.key_nums[:1]
             cand = []
             mention_only = False
@@ -3312,6 +3536,950 @@ def perturb(sents, facts, rng, kind, doc="summary", must_fids=None):
     return None
 
 
+
+# =============================================================================
+# 7-b. 환자별 통합 보고서 (1. 1일 요약지 + 검사 추이  2. CDSS  3. 검증 정보  4. 부모님 요약지) → md, html
+#   검사 추이 항목은 명세 JSON 의 "trend_items"(개념 키 목록)로 바꿀 수 있음. 없으면 TREND_DEFAULT.
+# =============================================================================
+
+TREND_DEFAULT = ["tbil", "crp", "glucose", "bst", "na", "k", "cr", "hb", "plt", "wbc", "ph", "pco2", "weight"]
+SPARK = "▁▂▃▄▅▆▇█"
+
+
+def trend_items():
+    S = PROFILE.get("_spec") or {}
+    return S.get("trend_items") or PROFILE.get("trend_items") or TREND_DEFAULT
+
+
+# ---------------------------------------------------------------------------
+# 문헌 기준값: 신생아 검사 참고범위·치료 기준선(neonatal_ref_literature.json)
+#   파일의 entries 를 그대로 읽어 재태주수(GA)·생후시간(PNA)에 맞는 항목을 고른다. JSON 을 고치면 바로 반영.
+#   같은 조건에 여러 문헌이 맞으면 모두 보여 주고, 띠는 파일에서 먼저 나온 문헌(=우선순위)으로 그린다.
+#   GA 를 알 수 없으면 GA 제한이 있는 문헌으로 띠를 그리지 않고 "재태주수 확인 필요"로 표시(추정하지 않음).
+# ---------------------------------------------------------------------------
+REF_LIT_FILE = "neonatal_ref_literature.json"
+REF_LIT = {"entries": [], "path": None}
+REF_BAND_KINDS = ("reference_interval", "prediction_limit")
+REF_LINE_KINDS = ("treatment_threshold", "target_range", "lower_limit")
+# (개념, 원 단위, 표시 단위) → 곱할 값. 단위는 _unorm 으로 정규화한 문자열
+UNIT_CONV = {("cr", "umol/l", "mg/dl"): 1 / 88.4, ("tbil", "umol/l", "mg/dl"): 1 / 17.1, ("dbil", "umol/l", "mg/dl"): 1 / 17.1,
+             ("glucose", "mmol/l", "mg/dl"): 18.0, ("hb", "g/l", "g/dl"): 0.1, ("hb", "mmol/l", "g/dl"): 1.611, ("crp", "mg/l", "mg/dl"): 0.1,
+             ("bun", "mmol/l", "mg/dl"): 2.8, ("ca", "mmol/l", "mg/dl"): 4.008, ("ica", "mmol/l", "mg/dl"): 4.008, ("mg", "mmol/l", "mg/dl"): 2.43,
+             ("phos", "mmol/l", "mg/dl"): 3.097, ("alb", "g/l", "g/dl"): 0.1, ("hct", "l/l", "%"): 100.0}
+
+
+def _unorm(u):
+    u = str(u or "").strip().lower().replace("µ", "u").replace("μ", "u").replace("㎕", "ul").replace("㎗", "dl").replace("³", "^3").replace(" ", "")
+    u = u.replace("×", "x").replace("meq/l", "mmol/l")
+    if re.fullmatch(r"x?10\^?9/l|x?10\^?3/ul|k/ul|x?10\^?3/mm\^?3|10\*3/ul", u):
+        return "10^3/ul"
+    return u
+
+
+def unit_factor(concept, frm, to):
+    a, b = _unorm(frm), _unorm(to)
+    if a == b or not a:
+        return 1.0
+    if (concept, a, b) in UNIT_CONV:
+        return UNIT_CONV[(concept, a, b)]
+    if (concept, b, a) in UNIT_CONV:
+        return 1.0 / UNIT_CONV[(concept, b, a)]
+    if a in ("cells/ul", "/ul", "cells/mm^3", "/mm^3") and b == "10^3/ul":   # 혈구 수: 개/µL → ×10³/µL
+        return 0.001
+    if a == "10^3/ul" and b in ("cells/ul", "/ul"):
+        return 1000.0
+    return None
+
+
+def load_ref_lit(path=None):
+    if path in ("none", "None"):
+        REF_LIT.update({"entries": [], "path": None})
+        return
+    if path is None:
+        for d in (os.getcwd(), os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()):
+            p = os.path.join(d, REF_LIT_FILE)
+            if os.path.exists(p):
+                path = p
+                break
+    if not path:
+        return
+    with open(path, encoding="utf-8") as fh:
+        J = json.load(fh)
+    es = [e for e in J.get("entries", []) if e.get("concept") and not e.get("disabled")]
+    srcs = J.get("sources", {})
+    for i, e in enumerate(es):
+        e.setdefault("id", "L%04d" % (i + 1))
+        if isinstance(e.get("source"), str):   # 공통 문헌 정보는 sources 에 한 번만 적고 키로 참조
+            e["source"] = dict(srcs.get(e["source"], {"citation": e["source"]}), **e.get("source_extra", {}))
+    REF_LIT.update({"entries": es, "path": path, "meta": {k: J.get(k) for k in ("version", "note", "updated")}})
+
+
+def ga_info(ctx):
+    """재태주수: 1) 차트 기록 숫자(재태·GA·gestational) 2) 진단 코드(P07.2x/P07.3x 주수 코드, P07.2=<28주, P07.3=28~36주). 없으면 None."""
+    if hasattr(ctx, "_ga"):
+        return ctx._ga
+    out = {"wk": None, "lo": None, "hi": None, "src": "재태주수 기록 없음"}
+    for df, table in ((ctx.chart, "CHARTEVENTS"), (getattr(ctx, "dte", None), "DATETIMEEVENTS")):
+        if df is None or df.empty or "itemid" not in df.columns:
+            continue
+        _labelize(ctx, df)
+        m = df[df["full_label"].str.contains(r"재태|gestational|\bGA\b", case=False, regex=True, na=False)]
+        for _, r in m.iterrows():
+            s = str(r.get("value"))
+            g = re.search(r"(\d{2})\s*(?:\+|주\s*)(\d)?", s) or re.fullmatch(r"\s*(\d{2}(?:\.\d+)?)\s*", s)
+            if g:
+                wk = float(g.group(1)) + (float(g.group(2)) / 7.0 if g.lastindex and g.lastindex >= 2 and g.group(2) else 0.0)
+                if 20 <= wk <= 45:
+                    out = {"wk": wk, "lo": wk, "hi": wk, "src": "%s %s=%s" % (table, r["full_label"], s)}
+                    break
+        if out["wk"] is not None:
+            break
+    if out["wk"] is None and not ctx.dx.empty and "icd_code" in ctx.dx.columns:
+        codes = ctx.dx["icd_code"].astype(str).str.replace(".", "", regex=False).str.upper().tolist()
+        wk_code = {"P0721": (None, 22.9), "P0722": (23, 23.9), "P0723": (24, 24.9), "P0724": (25, 25.9), "P0725": (26, 26.9), "P0726": (27, 27.9),
+                   "P0731": (28, 28.9), "P0732": (29, 29.9), "P0733": (30, 30.9), "P0734": (31, 31.9), "P0735": (32, 32.9), "P0736": (33, 33.9),
+                   "P0737": (34, 34.9), "P0738": (35, 35.9), "P0739": (36, 36.9)}
+        for c in codes:
+            if c[:5] in wk_code:
+                lo, hi = wk_code[c[:5]]
+                out = {"wk": None, "lo": lo, "hi": hi, "src": "진단 코드 %s" % c}
+                break
+        else:
+            for c in codes:
+                if c.startswith("P072"):
+                    out = {"wk": None, "lo": None, "hi": 27.9, "src": "진단 코드 %s(28주 미만)" % c}
+                    break
+                if c.startswith("P073"):
+                    out = {"wk": None, "lo": 28, "hi": 36.9, "src": "진단 코드 %s(28~36주)" % c}
+                    break
+    ctx._ga = out
+    return out
+
+
+def ctx_birth(ctx):
+    b = getattr(ctx, "birth", None)
+    if b is not None:
+        return pd.Timestamp(b), getattr(ctx, "birth_src", "")
+    if ctx.is_neonate and getattr(ctx, "admit", None) is not None:
+        return pd.Timestamp(ctx.admit), "입원 시각 근사"
+    return None, "출생 시각 확인 불가"
+
+
+def _ga_fit(e, ga):
+    """문헌 GA 구간과 환아 GA 의 관계: 'ok'(포함) / 'any'(문헌에 GA 제한 없음) / 'unknown'(환아 GA 모름) / None(불일치)"""
+    lo, hi = e.get("ga_min_wk"), e.get("ga_max_wk")
+    if lo is None and hi is None:
+        return "any"
+    if ga["lo"] is None and ga["hi"] is None:
+        return "unknown"
+    glo = ga["lo"] if ga["lo"] is not None else 0
+    ghi = ga["hi"] if ga["hi"] is not None else 99
+    elo = lo if lo is not None else 0
+    ehi = (hi + 0.99) if hi is not None else 99   # "36주"는 36+6 까지 포함
+    if elo <= glo and ghi <= ehi:
+        return "ok"
+    if ghi < elo or glo > ehi:
+        return None
+    return "unknown"
+
+
+def lit_match(concept, ga, pna_h, unit):
+    """해당 개념·GA·생후시간에 맞는 문헌 항목. 반환 [(entry, ga_fit, low, high)] (값은 unit 으로 환산, 환산 불가면 제외)"""
+    out = []
+    for e in REF_LIT["entries"]:
+        if e.get("concept") != concept or e.get("kind") in ("equation", "formula"):
+            continue
+        if pna_h is not None:
+            if e.get("pna_min_h") is not None and pna_h < e["pna_min_h"]:
+                continue
+            if e.get("pna_max_h") is not None and pna_h >= e["pna_max_h"]:
+                continue
+        elif e.get("pna_min_h") is not None or e.get("pna_max_h") is not None:
+            continue
+        g = ga
+        if e.get("ga_basis") == "pma" and pna_h is not None:   # 교정(월경후)연령 기준 표: GA + 생후 주수
+            w = pna_h / 168.0
+            g = {"wk": None, "lo": ga["lo"] + w if ga["lo"] is not None else None, "hi": ga["hi"] + w if ga["hi"] is not None else None}
+        fit = _ga_fit(e, g)
+        if fit is None:
+            continue
+        f = unit_factor(concept, e.get("unit"), unit) if unit else 1.0
+        if f is None:
+            continue
+        lo = e["low"] * f if e.get("low") is not None else None
+        hi = e["high"] * f if e.get("high") is not None else None
+        out.append((e, fit, lo, hi))
+    return out
+
+
+def lit_has(concept):
+    return any(e.get("concept") == concept for e in REF_LIT["entries"])
+
+
+def lit_cite(e):
+    s = e.get("source", {})
+    return s.get("short") or s.get("citation") or "출처 미기재"
+
+
+def lit_cond(e):
+    g = (e.get("ga_min_wk"), e.get("ga_max_wk"))
+    p = (e.get("pna_min_h"), e.get("pna_max_h"))
+    gs = "재태 전체" if g == (None, None) else "재태 %s~%s주" % (fmt_num(g[0]) if g[0] is not None else "", fmt_num(g[1]) if g[1] is not None else "")
+    if p[1] is None and (p[0] is None or p[0] == 0):
+        ps = "생후 전체"
+    elif p[1] is None:
+        ps = "생후 %s시간 이후" % fmt_num(p[0])
+    else:
+        ps = "생후 %s~%s시간 미만" % (fmt_num(p[0] or 0), fmt_num(p[1]))
+    return "%s · %s" % (gs, ps)
+
+
+def apply_lit(ctx, x):
+    """추이 항목 x 에 점별 문헌 띠(lit)·기준선(lines)·최근 값의 전체 비교(lit_last)를 붙임."""
+    x["lit"], x["lines"], x["lit_last"] = [], [], []
+    if not REF_LIT["entries"]:
+        return x
+    ga = ga_info(ctx)
+    b, bsrc = ctx_birth(ctx)
+    x["ga"], x["birth_src"] = ga, bsrc
+    for i, t in enumerate(x["t"]):
+        pna = (pd.Timestamp(t) - b).total_seconds() / 3600.0 if b is not None else None
+        ms = lit_match(x["key"], ga, pna, x["unit"])
+        band = next(((lo, hi, e) for e, fit, lo, hi in ms if e.get("kind", "reference_interval") in REF_BAND_KINDS and fit in ("ok", "any")), None)
+        x["lit"].append(band)
+        x["lines"].append([(lo, hi, e) for e, fit, lo, hi in ms if e.get("kind") in REF_LINE_KINDS and fit in ("ok", "any") and e.get("chart", True)])
+        if i == len(x["t"]) - 1:
+            x["lit_last"] = [dict(e=e, fit=fit, lo=lo, hi=hi, pna=pna) for e, fit, lo, hi in ms]
+    return x
+
+
+def rng_txt(lo, hi):
+    f = lambda z: fmt_num(round(z, 2))
+    if lo is not None and hi is not None:
+        return "%s ~ %s" % (f(lo), f(hi))
+    if hi is not None:
+        return "상한 %s" % f(hi)
+    return "하한 %s" % f(lo) if lo is not None else "-"
+
+
+def lit_judge(v, lo, hi):
+    if lo is not None and v < lo:
+        return "아래"
+    if hi is not None and v > hi:
+        return "위"
+    return "안"
+
+
+def lit_rows(x):
+    """최근 값과 모든 문헌 기준 비교 행: [(문헌, 종류, 조건, 기준, 판정, GA 적합)]"""
+    v = x["v"][-1]
+    rows = []
+    for m in x.get("lit_last", []):
+        e = m["e"]
+        rng = rng_txt(m["lo"], m["hi"])
+        lab = "%s–%s" % (e.get("low_label") or "", e.get("high_label") or "")
+        kind = {"reference_interval": "참고범위", "prediction_limit": "예측한계", "treatment_threshold": "치료 기준선", "target_range": "목표범위",
+                "lower_limit": "하한"}.get(e.get("kind"), e.get("kind", ""))
+        below = e.get("act_when") == "below"
+        one = m["hi"] if m["lo"] is None else (m["lo"] if m["hi"] is None else None)
+        if e.get("kind") in REF_LINE_KINDS and one is not None:
+            if below:
+                jd = "기준 미만(해당)" if v < one else "기준 이상"
+            else:
+                jd = "기준 초과(해당)" if v > one else "기준 이하"
+        elif e.get("kind") in REF_LINE_KINDS:
+            jd = {"아래": "기준 구간 아래", "위": "기준 구간 위", "안": "기준 구간 안"}[lit_judge(v, m["lo"], m["hi"])]
+        else:
+            jd = {"아래": "범위 아래", "위": "범위 위", "안": "범위 안"}[lit_judge(v, m["lo"], m["hi"])]
+        if m["fit"] == "unknown":
+            jd += "(재태주수 확인 필요)"
+        if e.get("risk_group"):
+            kind += " · " + e["risk_group"]
+        rows.append((e, kind, lit_cond(e), "%s %s (%s)" % (rng, x["unit"], lab.strip("–")), jd))
+    return rows
+
+
+def trend_series(ctx):
+    """ICU 입실 ~ 기준 시각의 항목별 시계열(원자료). 반환: [{key, label, unit, t[], v[], ref}]"""
+    out = []
+    for c in trend_items():
+        t, v, unit, ref = [], [], "", (None, None)
+        if c == "weight":
+            ws = [w for w in weight_series(ctx) if w[0] >= ctx.intime]
+            t, v, unit = [w[0] for w in ws], [w_disp(w[1]) for w in ws], ("g" if ws and ws[-1][1] < 10 else "kg")
+            label = "체중"
+        elif c == "bst":
+            if ctx.chart.empty:
+                continue
+            s = ctx.chart[(ctx.chart["concept"] == "bst") & (ctx.chart["t"] >= ctx.intime) & (ctx.chart["t"] <= ctx.t0)].dropna(subset=["v"]).sort_values("t")
+            t, v, unit, label = list(s["t"]), [float(x) for x in s["v"]], "mg/dL", "BST(현장 혈당)"
+            ref = tuple(PROFILE["ref_ranges"].get("glucose", (None, None)))
+        else:
+            if ctx.lab.empty:
+                continue
+            s = ctx.lab[(ctx.lab["concept"] == c) & (ctx.lab["t"] >= ctx.intime) & (ctx.lab["t"] <= ctx.t0)].dropna(subset=["v"]).sort_values("t")
+            if len(s):
+                t, v = list(s["t"]), [float(x) for x in s["v"]]
+                u = str(s["valueuom"].dropna().iloc[-1]) if ("valueuom" in s.columns and s["valueuom"].notna().any()) else ""
+                unit = "" if u in ("nan", "None") else u
+                ref = ref_range(s)
+            label = LAB_DISPLAY.get(c, c)
+        if len(t) >= 2:  # 기록이 1개뿐인 항목은 추이가 없으므로 제외
+            out.append(apply_lit(ctx, {"key": c, "label": label, "unit": unit, "t": t, "v": v, "ref": ref}))
+    return out
+
+
+def spark(vals, n=20):
+    if not vals:
+        return ""
+    if len(vals) > n:
+        step = len(vals) / float(n)
+        vals = [vals[int(i * step)] for i in range(n - 1)] + [vals[-1]]
+    lo, hi = min(vals), max(vals)
+    if hi - lo < 1e-9:
+        return SPARK[3] * len(vals)
+    return "".join(SPARK[int((x - lo) / (hi - lo) * (len(SPARK) - 1))] for x in vals)
+
+
+def trend_markdown(ctx, series, max_days=14):
+    if not series:
+        return ["- ICU 입실 이후 기록이 2개 이상인 추이 항목 없음."]
+    L = ["- 기간: ICU 입실 %s ~ 기준 시각 %s. 기록이 2개 이상인 항목만 표시. 원자료 집계값이며 검증기 대조 대상이 아님." % (fmt_t(ctx.intime), fmt_t(ctx.t0)), "",
+         "| 항목 | 단위 | 첫 값(시각) | 최저 | 최고 | 최근 값(시각) | 변화 | 추이 | 기록 수 |", "|---|---|---|---|---|---|---|---|---|"]
+    for x in series:
+        v, t = x["v"], x["t"]
+        d = v[-1] - v[0]
+        L.append("| %s | %s | %s(%s) | %s | %s | %s(%s) | %s%s | %s | %d |" % (
+            x["label"], x["unit"], fmt_num(v[0]), fmt_t(t[0]), fmt_num(min(v)), fmt_num(max(v)), fmt_num(v[-1]), fmt_t(t[-1]),
+            "+" if d > 0 else "", fmt_num(round(d, 2)), spark(v), len(v)))
+    days = pd.date_range(ctx.intime.normalize(), ctx.t0.normalize(), freq="D")
+    days = list(days[-max_days:])
+    L += ["", "일별 마지막 값(최근 %d일)" % len(days), "", "| 항목 | " + " | ".join(d.strftime("%m-%d") for d in days) + " |",
+          "|---|" + "---|" * len(days)]
+    for x in series:
+        s = pd.Series(x["v"], index=pd.DatetimeIndex(x["t"]))
+        last = s.groupby(s.index.normalize()).last()
+        L.append("| %s | " % x["label"] + " | ".join(fmt_num(last[d]) if d in last.index else "" for d in days) + " |")
+    L += [""] + lit_markdown(series)
+    return L
+
+
+def lit_markdown(series):
+    if not REF_LIT["entries"]:
+        return ["- 문헌 기준값 파일(%s) 없음: 그래프의 띠는 프로파일 고정 범위." % REF_LIT_FILE]
+    L = ["문헌 기준과 최근 값 비교(%s, 같은 조건에 맞는 문헌은 모두 표시)" % os.path.basename(REF_LIT["path"]), "",
+         "| 항목 | 최근 값 | 문헌 | 종류 | 적용 조건 | 기준 | 판정 |", "|---|---|---|---|---|---|---|"]
+    n = 0
+    for x in series:
+        for e, kind, cond, rng, jd in lit_rows(x):
+            L.append("| %s | %s %s | %s | %s | %s | %s | %s |" % (x["label"], fmt_num(x["v"][-1]), x["unit"], lit_cite(e), kind, cond, rng, jd))
+            n += 1
+        if not x.get("lit_last") and lit_has(x["key"]):
+            L.append("| %s | %s %s | - | - | - | 맞는 문헌 없음 | - |" % (x["label"], fmt_num(x["v"][-1]), x["unit"]))
+    for x in series[:1]:
+        ga = x.get("ga") or {}
+        L += ["", "- 재태주수: %s. 생후시간 기준: %s. 재태주수를 알 수 없으면 주수별 문헌은 띠로 그리지 않고 '재태주수 확인 필요'로 표시." % (
+            (fmt_num(round(ga["wk"], 1)) + "주 (" + ga.get("src", "") + ")") if ga.get("wk") else ga.get("src", "확인 불가"), x.get("birth_src") or "확인 불가")]
+    return L
+
+
+def _esc(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def point_band(x, i):
+    """i 번째 점의 (low, high, 출처문구). 문헌 띠가 있으면 문헌, 없으면 프로파일 고정 범위."""
+    lit = x.get("lit") or []
+    if any(lit):
+        b = lit[i] if i < len(lit) else None
+        return (b[0], b[1], lit_cite(b[2])) if b else (None, None, None)
+    rl, rh = x["ref"] if x["ref"] else (None, None)
+    return (rl, rh, "프로파일 고정 범위") if (rl is not None or rh is not None) else (None, None, None)
+
+
+def trend_svg(x, w=560, h=150):
+    t = [pd.Timestamp(a).value for a in x["t"]]
+    v = x["v"]
+    n = len(t)
+    bands = [point_band(x, i) for i in range(n)]
+    lines = x.get("lines") or [[] for _ in range(n)]
+    lo, hi = min(v), max(v)
+    for b in bands:
+        for r in b[:2]:
+            if r is not None:
+                lo, hi = min(lo, r), max(hi, r)
+    for ls in lines:
+        for a, b, e in ls:
+            for r in (a, b):
+                if r is not None:
+                    lo, hi = min(lo, r), max(hi, r)
+    pad = (hi - lo) * 0.1 or 1.0
+    lo, hi = lo - pad, hi + pad
+    t0, t1 = min(t), max(t)
+    span = (t1 - t0) or 1
+    L, R, T, B = 48, 12, 18, 26
+
+    def X(a):
+        return L + (a - t0) / span * (w - L - R)
+
+    def Y(b):
+        return T + (hi - b) / (hi - lo) * (h - T - B)
+
+    def seg(i):
+        xa = X(t[i])
+        xb = X(t[i + 1]) if i + 1 < n else w - R
+        if i == 0:
+            xa = L
+        return xa, max(xb, xa + 2)
+    parts = ['<svg viewBox="0 0 %d %d" width="100%%" style="max-width:%dpx" role="img" aria-label="%s 추이">' % (w, h, w, _esc(x["label"]))]
+    for i, (rl, rh, src) in enumerate(bands):   # 점마다 생후시간이 달라 기준이 바뀌면 계단형 띠
+        if rl is None and rh is None:
+            continue
+        xa, xb = seg(i)
+        ya, yb = Y(rh) if rh is not None else T, Y(rl) if rl is not None else h - B
+        parts.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="#2e7d32" opacity="0.12"><title>%s ~ %s (%s)</title></rect>' % (
+            xa, ya, xb - xa, max(0, yb - ya), fmt_num(round(rl, 2)) if rl is not None else "", fmt_num(round(rh, 2)) if rh is not None else "", _esc(src)))
+    for i, ls in enumerate(lines):
+        xa, xb = seg(i)
+        for a, b, e in ls:
+            for r in (a, b):
+                if r is not None:
+                    parts.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="#c62828" stroke-width="1.4" stroke-dasharray="4 3"><title>%s %s (%s)</title></line>' % (
+                        xa, Y(r), xb, Y(r), _esc(e.get("high_label") or e.get("low_label") or "기준선"), fmt_num(round(r, 2)), _esc(lit_cite(e))))
+    parts.append('<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="#999" stroke-width="1"/>' % (L, h - B, w - R, h - B))
+    pts = " ".join("%.1f,%.1f" % (X(a), Y(b)) for a, b in zip(t, v))
+    parts.append('<polyline points="%s" fill="none" stroke="#1565c0" stroke-width="1.8"/>' % pts)
+    for i, (a, b) in enumerate(zip(t, v)):
+        rl, rh, src = bands[i]
+        out = (rl is not None and b < rl) or (rh is not None and b > rh)
+        ref_t = (" · 기준 %s~%s (%s)" % (fmt_num(round(rl, 2)) if rl is not None else "", fmt_num(round(rh, 2)) if rh is not None else "", src)) if src else ""
+        parts.append('<circle cx="%.1f" cy="%.1f" r="2.6" fill="%s"><title>%s %s%s</title></circle>' % (X(a), Y(b), "#c62828" if out else "#1565c0",
+                                                                                                      fmt_t(pd.Timestamp(a)), fmt_num(b), _esc(ref_t)))
+    for b in (max(v), min(v)):
+        parts.append('<text x="%d" y="%.1f" font-size="10" text-anchor="end" fill="#555">%s</text>' % (L - 4, Y(b) + 3, fmt_num(b)))
+    parts.append('<text x="%d" y="%d" font-size="10" fill="#555">%s</text>' % (L, h - 8, fmt_t(pd.Timestamp(t0))))
+    parts.append('<text x="%d" y="%d" font-size="10" text-anchor="end" fill="#555">%s</text>' % (w - R, h - 8, fmt_t(pd.Timestamp(t1))))
+    parts.append('<text x="%d" y="12" font-size="11" fill="#222">%s %s</text>' % (L, _esc(x["label"]), _esc(("(" + x["unit"] + ")") if x["unit"] else "")))
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def ref_caption(x):
+    """그래프 아래 기준 설명 한 줄(무엇을 초록 띠·빨간 점선으로 그렸는지)."""
+    lit = [b for b in (x.get("lit") or []) if b]
+    ga = x.get("ga") or {}
+    if lit:
+        es = []
+        for b in lit:
+            if b[2] not in es:
+                es.append(b[2])
+        s = "초록 띠: " + "; ".join("%s (%s–%s, %s)" % (lit_cite(e), e.get("low_label") or "", e.get("high_label") or "", lit_cond(e)) for e in es)
+    elif x.get("ref") and any(r is not None for r in x["ref"]):
+        s = "초록 띠: 프로파일 고정 범위(문헌·재태주수·생후시간 미반영)"
+        if REF_LIT["entries"]:
+            pend = [m for m in x.get("lit_last", []) if m["fit"] == "unknown"]
+            s += " — 맞는 문헌 기준 없음" + (", 재태주수 확인 필요(후보 %d개)" % len(pend) if pend else "")
+    else:
+        s = "기준 범위 없음"
+    ln = []
+    for ls in x.get("lines") or []:
+        for a, b, e in ls:
+            if e not in ln:
+                ln.append(e)
+    if ln:
+        s += " · 빨간 점선: " + "; ".join("%s %s (%s)" % (e.get("high_label") or e.get("low_label") or "기준선", lit_cite(e), lit_cond(e)) for e in ln)
+    if REF_LIT["entries"]:
+        s += " · 재태주수: %s · 생후시간: %s" % ((fmt_num(round(ga["wk"], 1)) + "주") if ga.get("wk") else ga.get("src", "확인 불가"), x.get("birth_src") or "확인 불가")
+    return s
+
+
+def _strip_cites(t):
+    return re.sub(r"\s*\[F\d{3}(?:\s*,\s*F\d{3})*\]", "", re.sub(r"\s*\(규칙 [^)]*\)", "", t))
+
+
+def report_markdown(ctx, res, series):
+    s, q = res["summary"], res["parent"]
+    sm, pm = s["metrics"], q["metrics"]
+    title = PROFILE["documents"]["summary"]["title"]
+    pre = note_markdown(ctx, [x for x in s["sents"] if x["section"] != CDSS_SEC()], doc="summary").splitlines()
+    head = []
+    for l in pre[1:]:
+        if l.startswith("## "):
+            break
+        if l.startswith("- "):
+            head.append(l)
+    L = ["# 환자별 NICU 보고서 — 환자 ID %s, %s 기준" % (ctx.subject_id, fmt_t(ctx.t0)), ""] + head + ["",
+         "> 자동 생성 초안이며 의료진 검토가 필요합니다. 문장 끝 [F###]은 근거 fact 번호이고, 3장 검증 정보와 연결됩니다.", ""]
+    L += ["## 1. 1일 요약지 — %s" % title.replace(" (자동 생성 초안, 의료진 검토 필요)", "")]
+    vd = {v["sid"]: v for v in s["verdicts"]}
+    cur = None
+    for x in s["sents"]:
+        if x["section"] == CDSS_SEC():
+            continue
+        if x["section"] != cur:
+            cur = x["section"]
+            L += ["", "### " + SECTIONS.get(cur, cur)]
+        mark = "  ⚠️검증: %s" % vd[x["sid"]]["label"] if vd.get(x["sid"], {}).get("label") not in (None, "Supported") else ""
+        L.append("- " + x["text"] + mark)
+    L += ["", "### 검사 추이(ICU 입실 이후)", ""] + trend_markdown(ctx, series)
+    L += ["", "## 2. CDSS 알림(규칙 기반 + 트리 모델, 인계문과 별도)"]
+    if res["alerts"]:
+        L += ["", "| 심각도 | 알림 | 내용 | 권고 행동(검토 제안) | 근거 fact | 규칙·모델 | 참고 |", "|---|---|---|---|---|---|---|"]
+        order = {"high": 0, "medium": 1, "info": 2}
+        for a in sorted(res["alerts"], key=lambda x: order.get(x["severity"], 3)):
+            L.append("| %s | %s | %s | %s | %s | %s | %s |" % (a["severity"].upper(), a["title"], a["text"], a.get("action", "-"), ", ".join(a["trigger_fact_ids"]),
+                                                             a["rule_id"], a["reference"]))
+        L.append("- 권고 행동은 병원 프로토콜 확인을 돕는 검토 제안이며 처방이 아님. 문구는 프로파일 cdss.actions 에서 수정.")
+    else:
+        L.append("- 규칙 기반 알림 없음.")
+    L += ["", "## 3. 검증 정보", "", "| 지표 | 1일 요약지 | 부모님 요약지 |", "|---|---|---|"]
+    for k, nm in (("n_sentences", "문장 수"), ("supported", "근거 일치"), ("contradicted", "근거와 불일치"), ("not_addressed", "기록에 근거 없음"),
+                  ("unverifiable", "판정 불가"), ("hallucination_rate", "할루시네이션율"), ("n_must", "필수 정보 수"), ("missing", "필수 정보 누락"),
+                  ("partial", "부분 전달"), ("omission_rate", "누락율"), ("checklist_required", "명세 필수 요소"), ("checklist_from_data", "데이터로 채움"),
+                  ("checklist_gap", "확인 필요로 표시"), ("checklist_required_missing_in_note", "문서에서 빠진 필수 요소")):
+        L.append("| %s | %s | %s |" % (nm, sm.get(k, "-"), pm.get(k, "-")))
+    L.append("| 부모님 요약지 문장 평균 길이(자) | - | %s |" % pm.get("read_avg_chars", "-"))
+    bad = [(x, vd[x["sid"]]) for x in s["sents"] if vd.get(x["sid"], {}).get("label") not in (None, "Supported")]
+    qvd = {v["sid"]: v for v in q["verdicts"]}
+    bad += [(x, qvd[x["sid"]]) for x in q["sents"] if qvd.get(x["sid"], {}).get("label") not in (None, "Supported")]
+    L += ["", "- 판정 기준: 문장의 수치·시각·약물·사건이 인용한 근거 fact와 일치하면 '근거 일치'. 필수 정보는 명세 요소와 중요도 2 이상 fact 기준."]
+    L.append("- 근거와 맞지 않는 문장: " + ("없음" if not bad else "%d건" % len(bad)))
+    for x, v in bad[:20]:
+        L.append("  - %s → %s(%s)" % (_strip_cites(x["text"])[:80], v["label"], v["reason"]))
+    miss = [c for c in s["coverage"] + q["coverage"] if c["status"] != "Covered"]
+    L.append("- 누락·부분 전달 필수 정보: " + ("없음" if not miss else "%d건" % len(miss)))
+    for c in miss[:20]:
+        L.append("  - %s %s: %s" % (c["fact_id"], c["status"], c["text"][:80]))
+    L += ["", "명세 필수 요소 반영 현황", "", "| 영역 | 요소 | 필수 | 데이터 | 문서 반영 | 근거 |", "|---|---|---|---|---|---|"]
+    lab = {"data": "있음", "gap": "없음(확인 필요)", "absent": "없음", "n/a": "해당 없음"}
+    inl = {"covered": "반영", "missing": "누락", "n/a": "-"}
+    for c in s["checklist"]:
+        L.append("| %s | %s | %s | %s | %s | %s |" % (c.get("area") or "", c["label"], "필수" if c["required"] else "선택", lab.get(c["status"], c["status"]),
+                                                   inl.get(c.get("in_note"), c.get("in_note")), ", ".join(c["fact_ids"][:4])))
+    L += ["", "근거 fact 목록(출처 테이블)", "", "| fact | 유형 | 내용 | 출처 |", "|---|---|---|---|"]
+    for f in res["facts"]:
+        src = sorted({p.get("table", "파생") for p in f.prov if isinstance(p, dict)}) or ["-"]
+        L.append("| %s | %s | %s | %s |" % (f.fid, f.ftype, f.text.replace("|", "/")[:120], ", ".join(src)))
+    L += ["", "- 한계: 검증기는 문장이 추출된 fact와 맞는지를 확인합니다. 원자료에서 fact를 뽑는 단계의 오류(측정 오류값, 라벨 오인식)는 이 표로 확인할 수 없어 의료진 검토가 필요합니다."]
+    L += ["", "## 4. 부모님 요약지(보호자 Daily Briefing, 간호사 확인 전)", ""] + [
+        l.replace("## ", "### ", 1) if l.startswith("## ") else l
+        for l in parent_markdown(ctx, q["sents"], res["facts"], res["alerts"], sid_=res.get("ssot_id")).splitlines()[1:]]
+    return "\n".join(L) + "\n"
+
+
+def md_to_html(md, title, svgs):
+    """보고서용 최소 마크다운 → HTML 변환(제목·목록·표·인용). '### 검사 추이' 아래에 SVG 그래프 삽입."""
+    out, in_list, in_table = [], False, False
+
+    def close():
+        nonlocal in_list, in_table
+        if in_list:
+            out.append("</ul>")
+            in_list = False
+        if in_table:
+            out.append("</tbody></table>")
+            in_table = False
+    lines = md.splitlines()
+    for i, l in enumerate(lines):
+        if l.startswith("|"):
+            cells = [c.strip() for c in l.strip().strip("|").split("|")]
+            if re.match(r"^\|(\s*-+\s*\|)+$", l.strip()):
+                continue
+            if not in_table:
+                close()
+                out.append("<table><thead><tr>%s</tr></thead><tbody>" % "".join("<th>%s</th>" % _esc(c) for c in cells))
+                in_table = True
+            else:
+                out.append("<tr>%s</tr>" % "".join("<td>%s</td>" % _esc(c) for c in cells))
+            continue
+        if l.startswith("- ") or l.startswith("  - "):
+            if in_table:
+                close()
+            if not in_list:
+                out.append("<ul>")
+                in_list = True
+            cls = ' class="sub"' if l.startswith("  - ") else ""
+            out.append("<li%s>%s</li>" % (cls, _esc(l.strip()[2:])))
+            continue
+        close()
+        if l.startswith("#"):
+            n = len(l) - len(l.lstrip("#"))
+            out.append("<h%d>%s</h%d>" % (n, _esc(l[n:].strip()), n))
+            if l.startswith("### 검사 추이") and svgs:
+                out.append('<div class="charts">%s</div>' % "".join('<div class="chart">%s</div>' % s for s in svgs))
+        elif l.startswith("> "):
+            out.append("<blockquote>%s</blockquote>" % _esc(l[2:]))
+        elif l.strip():
+            out.append("<p>%s</p>" % _esc(l))
+    close()
+    css = ("body{font-family:-apple-system,'Malgun Gothic','Apple SD Gothic Neo',sans-serif;max-width:1100px;margin:24px auto;padding:0 16px;color:#222;line-height:1.5}"
+           "h1{font-size:22px;border-bottom:2px solid #333;padding-bottom:6px}h2{font-size:18px;margin-top:28px;border-bottom:1px solid #ccc}h3{font-size:15px}"
+           "table{border-collapse:collapse;margin:8px 0;font-size:13px}th,td{border:1px solid #ccc;padding:3px 6px;vertical-align:top}th{background:#f2f2f2}"
+           "li.sub{margin-left:18px;color:#555}blockquote{color:#555;border-left:3px solid #ccc;margin:8px 0;padding-left:10px}"
+           ".charts{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:8px}.chart{border:1px solid #eee;padding:4px}")
+    return "<!doctype html><html lang=\"ko\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>%s</title><style>%s</style></head><body>%s</body></html>" % (
+        _esc(title), css, "\n".join(out))
+
+
+
+# ---- 대화형 HTML 보고서: 값 호버 → 검증 판정·근거 fact·원자료 행. 맨 위에 필수 정보 점검 패널.
+RAW_SRC = {  # 출처 테이블 → (StayContext 속성, ID 열, 표시 열)
+    "CHARTEVENTS": ("chart", "chartevent_id", ["charttime", "itemid", "value", "valueuom"]),
+    "LABEVENTS": ("lab", "labevent_id", ["charttime", "itemid", "label", "value", "valueuom", "ref_range_lower", "ref_range_upper"]),
+    "INPUTEVENTS": ("inp", "inputevent_id", ["starttime", "endtime", "itemid", "amount", "amountuom", "patientweight"]),
+    "OUTPUTEVENTS": ("out", "outputevent_id", ["charttime", "itemid", "value", "valueuom"]),
+    "EMAR": ("emar", "emar_id", ["charttime", "medication", "event_txt", "infusion_rate_hr", "infusion_rate_min"]),
+    "MICROBIOLOGYEVENTS": ("micro", "microevent_id", ["charttime", "spec_type_desc", "test_name", "org_name", "ab_name", "interpretation", "storetime"]),
+    "PROCEDUREEVENTS": ("proc", "procedureevent_id", ["starttime", "endtime", "itemid", "value"]),
+    "TESTEVENTS": ("test", "testevent_id", ["charttime", "itemid"]),
+    "DATETIMEEVENTS": ("dte", "datetimeevent_id", ["charttime", "itemid", "value"]),
+    "DIAGNOSES_ICD": ("dx", "icd_code", ["seq_num", "icd_code", "icd_version"]),
+    "PROCEDURES_ICD": ("px", "icd_code", ["chartdate", "icd_code", "icd_version"]),
+    "PRESCRIPTIONS": ("rx", "pharmacy_id", ["starttime", "stoptime", "drug", "dose_val_rx", "dose_unit_rx", "route"]),
+    "SERVICES": ("services", "hadm_id", ["transfertime", "curr_service"]),
+    "ICUSTAYS": (None, "stay_id", ["first_careunit", "intime", "outtime", "los"]),
+    "PATIENTS": ("pat", "subject_id", ["subject_id", "sex", "anchor_age", "anchor_year"]),
+    "ADMISSIONS": ("adm", "hadm_id", ["admittime", "dischtime", "admission_type"]),
+}
+_VAL_COLS = {"chart": "v", "lab": "v", "inp": "v", "out": "v"}
+
+
+def _raw_label(ctx, r):
+    i = r.get("itemid")
+    if i is not None and i in ctx.item_map:
+        return ctx.item_map[i][1]
+    if i is not None and i in ctx.lab_map:
+        return ctx.lab_map[i][1]
+    return r.get("label") or r.get("medication") or ""
+
+
+def _raw_row(ctx, table, row, idcol):
+    keep = RAW_SRC.get(table, (None, None, []))[2]
+    d = {"table": table, "id": str(row.get(idcol, "")), "label": _raw_label(ctx, row)}
+    for c in keep:
+        if c in row and pd.notna(row[c]) and str(row[c]) not in ("nan", ""):
+            d[c] = str(row[c])
+    return d
+
+
+def raw_rows_of(ctx, f, limit=12):
+    """fact 출처(prov)의 원자료 행. 파생 fact 는 입력 fact 의 출처를 따라감."""
+    out = []
+    for p in f.prov:
+        if not isinstance(p, dict):
+            continue
+        t = p.get("table")
+        if t == "ICUSTAYS":
+            out.append({"table": t, "id": str(ctx.stay_id), "label": "ICU 입실",
+                        **{c: str(ctx.row.get(c)) for c in RAW_SRC[t][2] if c in ctx.row and pd.notna(ctx.row.get(c))}})
+            continue
+        if t not in RAW_SRC:
+            continue
+        attr, idc, _ = RAW_SRC[t]
+        df = getattr(ctx, attr, None)
+        if df is None or df.empty or idc not in df.columns:
+            continue
+        m = df[df[idc].astype(str) == str(p.get("row_id"))]
+        for _, r in m.head(3).iterrows():
+            out.append(_raw_row(ctx, t, r, idc))
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+def raw_match(ctx, facts, x, limit=3):
+    """문장 속 숫자 x 를 만든 원자료 행 찾기: 인용 fact 개념의 원자료 중 값이 같은 행(ICU 입실~기준 시각)."""
+    hits = []
+    for f in facts:
+        cons = {c for c in f.concepts if not c.startswith(("chk:", "pchk:", "cls:", "med:"))}
+        for attr, table, idc in (("chart", "CHARTEVENTS", "chartevent_id"), ("lab", "LABEVENTS", "labevent_id"),
+                                 ("inp", "INPUTEVENTS", "inputevent_id"), ("out", "OUTPUTEVENTS", "outputevent_id")):
+            df = getattr(ctx, attr, None)
+            if df is None or df.empty or "concept" not in df.columns:
+                continue
+            d = df[df["concept"].isin(cons) & (df["t"] >= ctx.intime) & (df["t"] <= ctx.t0)]
+            if d.empty:
+                continue
+            v = to_num(d["v"])
+            ok = (v - x).abs() <= max(0.051, 0.01 * abs(x))
+            if "weight" in cons:
+                ok = ok | ((v / 1000.0 - x).abs() <= 0.051) | ((v * 1000.0 - x).abs() <= 1.0)
+            for _, r in d[ok].sort_values("t").tail(limit).iterrows():
+                hits.append(_raw_row(ctx, table, r, idc))
+        if len(hits) >= limit:
+            break
+    return hits[:limit]
+
+
+def _rows_html(rows):
+    if not rows:
+        return "<div class='muted'>연결된 원자료 행 없음(고정 문구·계산값·데이터 없음 표시)</div>"
+    cols = ["table", "id", "label"] + [c for c in ("charttime", "starttime", "endtime", "storetime", "value", "amount", "valueuom", "amountuom",
+                                                   "ref_range_lower", "ref_range_upper", "medication", "event_txt", "infusion_rate_hr", "infusion_rate_min",
+                                                   "spec_type_desc", "org_name", "ab_name", "interpretation", "drug", "dose_val_rx", "dose_unit_rx", "route",
+                                                   "icd_code", "seq_num", "patientweight", "first_careunit", "intime", "outtime", "curr_service", "sex",
+                                                   "admittime") if any(c in r for r in rows)]
+    h = "<table class='raw'><tr>%s</tr>" % "".join("<th>%s</th>" % _esc(c) for c in cols)
+    for r in rows:
+        h += "<tr>%s</tr>" % "".join("<td>%s</td>" % _esc(r.get(c, "")) for c in cols)
+    return h + "</table>"
+
+
+VERDICT_KO = {"Supported": ("근거 일치", "ok"), "Contradicted": ("근거와 불일치", "bad"), "NotAddressed": ("기록에 근거 없음", "bad"),
+              "Unverifiable": ("판정 불가", "warn")}
+
+
+def sentence_html(ctx, x, v, F, sid_anchor=True):
+    """문장 → 숫자마다 호버(원자료 행), 끝에 판정 배지 호버(판정·사유·근거 fact·출처 행)."""
+    text = x["text"]
+    cf = [F[c] for c in x.get("cites", []) if c in F]
+    body = re.sub(r"\s*\[F\d{3}(?:\s*,\s*F\d{3})*\]", "", re.sub(r"\s*\(규칙 [^)]*\)", "", text))
+    masked = strip_keep(body)
+    parts, pos = [], 0
+    for m in NUM_RX.finditer(masked):
+        parts.append(_esc(body[pos:m.start()]))
+        val = float(m.group(0))
+        hits = raw_match(ctx, cf, val) if cf else []
+        inner = ("<b>값 %s의 원자료</b>" % _esc(m.group(0))) + (_rows_html(hits) if hits else
+                                                         "<div class='muted'>한 행과 바로 일치하지 않음 → 여러 행의 합계·비율 같은 계산값. 아래 근거 fact의 출처 행 참고.</div>"
+                                                         + "".join(_rows_html(raw_rows_of(ctx, f, 6)) for f in cf[:2]))
+        parts.append("<span class='tip num %s' tabindex='0'>%s<span class='pop'>%s</span></span>" % ("hit" if hits else "calc", _esc(body[m.start():m.end()]), inner))
+        pos = m.end()
+    parts.append(_esc(body[pos:]))
+    lab, cls = VERDICT_KO.get((v or {}).get("label"), ("고정 문구", "fix")) if not x.get("fixed") else ("고정 문구", "fix")
+    pop = "<b>검증: %s</b>" % lab
+    if v and v.get("reason"):
+        pop += "<div>사유: %s</div>" % _esc(v["reason"])
+    for f in cf:
+        pop += "<div class='fact'><b>%s</b> %s <span class='muted'>(%s, 중요도 %d)</span></div>%s" % (f.fid, _esc(f.text), f.ftype, f.salience, _rows_html(raw_rows_of(ctx, f)))
+        der = [p for p in f.prov if isinstance(p, dict) and "derived_from" in p]
+        if der:
+            pop += "<div class='muted'>파생 fact: 입력 %s</div>" % _esc(der[0]["derived_from"])
+    badge = "<span class='tip badge %s' tabindex='0'>%s<span class='pop wide'>%s</span></span>" % (cls, "✔" if cls == "ok" else ("•" if cls == "fix" else "⚠"), pop)
+    anchor = " id='%s'" % x["sid"] if sid_anchor else ""
+    return "<li%s>%s %s</li>" % (anchor, "".join(parts), badge)
+
+
+def coverage_panel_html(res, doc_label=("1일 요약지", "부모님 요약지")):
+    """필수 정보 점검: 명세 요소별 상태 칸 + 중요 fact 미인용 점검."""
+    s = res["summary"]
+    cited = {c for x in s["sents"] for c in x.get("cites", [])}
+    st_cls = {"covered": "ok", "missing": "bad"}
+    req = [c for c in s["checklist"] if c["required"]]
+    n_cov = sum(1 for c in req if c["status"] == "data" and c.get("in_note") == "covered")
+    n_gap = sum(1 for c in req if c["status"] == "gap")
+    n_miss = sum(1 for c in req if c.get("in_note") == "missing")
+    must = [f for f in res["facts"] if f.must and f.section in SECTIONS and f.section != CDSS_SEC() and f.ftype not in ("checklist_gap",)]
+    unc = [f for f in must if f.fid not in cited]
+    covv = [c for c in s["coverage"] if c["status"] != "Covered"]
+    h = ["<section class='panel'><h2>0. 필수 정보 점검</h2>",
+         "<div class='kpis'>"
+         "<div class='kpi ok'><b>%d</b><span>필수 요소 데이터로 반영</span></div>" % n_cov +
+         "<div class='kpi warn'><b>%d</b><span>데이터 없음 → '확인 필요' 표시</span></div>" % n_gap +
+         "<div class='kpi %s'><b>%d</b><span>문서에서 빠진 필수 요소</span></div>" % ("bad" if n_miss else "ok", n_miss) +
+         "<div class='kpi %s'><b>%d</b><span>중요 fact 중 문서에 안 쓰인 것(%d개 중)</span></div>" % ("bad" if unc else "ok", len(unc), len(must)) +
+         "<div class='kpi %s'><b>%d</b><span>필수 fact 누락·부분 전달</span></div>" % ("bad" if covv else "ok", len(covv)) + "</div>",
+         "<p class='muted'>판정 방법: (1) 명세 JSON의 영역별 필수 요소마다 원자료 출처를 찾아 데이터가 있으면 문서 반영 여부를, 없으면 '확인 필요' 표시 여부를 확인. "
+         "(2) 원자료에서 중요도 2 이상으로 뽑힌 fact가 문서 어느 문장에 인용됐는지 거꾸로 확인. 칸을 누르면 해당 문장으로 이동.</p>"]
+    areas = OrderedDict()
+    for c in s["checklist"]:
+        areas.setdefault(c["section"], []).append(c)
+    h.append("<div class='grid'>")
+    for sec, items in areas.items():
+        h.append("<div class='area'><div class='aname'>%s</div>" % _esc(SECTIONS.get(sec, sec)))
+        for c in items:
+            if c["status"] == "data":
+                cls, lab = st_cls.get(c.get("in_note"), "ok"), ("반영" if c.get("in_note") == "covered" else "누락")
+            elif c["status"] == "gap":
+                cls, lab = "warn", "확인 필요"
+            else:
+                cls, lab = "na", "해당 없음" if not c["required"] else "-"
+            fid = c["fact_ids"][0] if c["fact_ids"] else None
+            target = next((x["sid"] for x in s["sents"] if fid and fid in x.get("cites", [])), None)
+            tag = "a href='#%s'" % target if target else "span"
+            h.append("<%s class='cell %s' title='%s · %s · 근거 %s'>%s<small>%s%s</small></%s>" % (
+                tag, cls, _esc(c["label"]), lab, ", ".join(c["fact_ids"][:4]) or "-", _esc(c["label"]), lab, "" if c["required"] else " · 선택",
+                "a" if target else "span"))
+        h.append("</div>")
+    h.append("</div>")
+    if unc:
+        h.append("<details open><summary>문서에 안 쓰인 중요 fact %d개</summary><ul>%s</ul></details>" % (
+            len(unc), "".join("<li>%s %s</li>" % (f.fid, _esc(f.text)) for f in unc)))
+    h.append("<div class='legend'><span class='cell ok'>반영</span><span class='cell warn'>데이터 없음·확인 필요</span>"
+             "<span class='cell bad'>문서에서 누락</span><span class='cell na'>조건부·해당 없음</span></div></section>")
+    return "\n".join(h)
+
+
+REPORT_CSS = """
+:root{--ok:#2e7d32;--okb:#e8f5e9;--warn:#b26a00;--warnb:#fff4e0;--bad:#c62828;--badb:#fdecea;--na:#757575;--nab:#f2f2f2;--ink:#222;--line:#ddd}
+body{font-family:-apple-system,'Malgun Gothic','Apple SD Gothic Neo',sans-serif;max-width:1180px;margin:20px auto;padding:0 16px;color:var(--ink);line-height:1.55;background:#fff}
+h1{font-size:22px;border-bottom:2px solid #333;padding-bottom:6px}h2{font-size:18px;margin-top:30px;border-bottom:1px solid #ccc;padding-bottom:4px}h3{font-size:15px;margin:16px 0 4px}
+.meta{color:#555;font-size:13px}.muted{color:#777;font-size:12px}
+ul.sents{list-style:none;padding-left:0}ul.sents li{padding:3px 0;border-bottom:1px dashed #eee}
+.tip{position:relative;cursor:help}.tip:focus{outline:2px solid #90caf9}
+.num{border-bottom:2px dotted #1565c0;padding:0 1px}.num.calc{border-bottom-color:#b26a00}
+.tip .pop{display:none;position:absolute;z-index:20;left:0;top:1.5em;min-width:min(340px,calc(100vw - 24px));max-width:min(720px,calc(100vw - 24px));box-sizing:border-box;overflow-x:auto;background:#fff;border:1px solid #999;
+ box-shadow:0 4px 14px rgba(0,0,0,.18);padding:8px 10px;font-size:12px;font-weight:normal;color:#222;white-space:normal}
+.chart .cap{font-size:11px;color:#555;margin:2px 0 8px 0}
+.tip .pop.wide{min-width:min(520px,calc(100vw - 24px))}
+.tip .pop.fixed{position:fixed;top:0;left:0}
+.tip:hover>.pop,.tip:focus>.pop,.tip:focus-within>.pop{display:block}
+.badge{display:inline-block;width:18px;height:18px;line-height:18px;text-align:center;border-radius:9px;font-size:11px;color:#fff;margin-left:4px}
+.badge.ok{background:var(--ok)}.badge.bad{background:var(--bad)}.badge.warn{background:var(--warn)}.badge.fix{background:#9e9e9e}
+table{border-collapse:collapse;margin:6px 0;font-size:13px}th,td{border:1px solid var(--line);padding:3px 6px;vertical-align:top}th{background:#f4f4f4}
+table.raw{font-size:11px;margin:4px 0}table.raw td,table.raw th{padding:2px 4px}
+.fact{margin-top:6px;border-top:1px solid #eee;padding-top:4px}
+.panel{border:1px solid #cfd8dc;background:#fafcfd;padding:4px 14px 12px;border-radius:6px}
+.kpis{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}.kpi{flex:1 1 160px;border-radius:6px;padding:8px 10px}.kpi b{font-size:22px;display:block}
+.kpi span{font-size:12px}.kpi.ok{background:var(--okb);color:var(--ok)}.kpi.warn{background:var(--warnb);color:var(--warn)}.kpi.bad{background:var(--badb);color:var(--bad)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:8px}.area{border:1px solid var(--line);border-radius:6px;padding:6px;background:#fff}
+.aname{font-weight:bold;font-size:13px;margin-bottom:4px}
+.cell{display:inline-block;margin:2px;padding:2px 6px;border-radius:4px;font-size:12px;text-decoration:none;color:inherit}
+.cell small{display:block;font-size:10px;opacity:.8}.cell.ok{background:var(--okb);color:var(--ok)}.cell.warn{background:var(--warnb);color:var(--warn)}
+.cell.bad{background:var(--badb);color:var(--bad);font-weight:bold}.cell.na{background:var(--nab);color:var(--na)}
+.legend{margin-top:8px}.legend .cell{font-size:11px}
+.charts{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:8px}.chart{border:1px solid #eee;padding:4px}
+.sev-high{color:var(--bad);font-weight:bold}.sev-medium{color:var(--warn);font-weight:bold}.sev-info{color:#555}
+.brief p{font-size:15px;line-height:1.8}.note{background:#f6f8fa;border-left:3px solid #90a4ae;padding:6px 10px;font-size:13px;color:#444}
+"""
+
+
+def lit_src_pop(e):
+    s = e.get("source", {})
+    rows = [("인용", s.get("citation")), ("위치", s.get("location")), ("대상", e.get("population")), ("n", e.get("n")),
+            ("원문", e.get("quote")), ("원 단위", e.get("unit")), ("DOI", s.get("doi")), ("PMID", s.get("pmid"))]
+    body = "".join("<div><b>%s</b> %s</div>" % (k, _esc(v)) for k, v in rows if v not in (None, ""))
+    if s.get("url"):
+        body += "<div><b>URL</b> <a href='%s' target='_blank' rel='noopener'>%s</a></div>" % (_esc(s["url"]), _esc(s["url"]))
+    return "<span class='tip num hit' tabindex='0'>%s<span class='pop wide'>%s</span></span>" % (_esc(lit_cite(e)), body)
+
+
+def lit_html(series):
+    if not REF_LIT["entries"]:
+        return "<p class='muted'>문헌 기준값 파일(%s) 없음: 그래프의 띠는 프로파일 고정 범위입니다.</p>" % REF_LIT_FILE
+    H = ["<h4>문헌 기준과 최근 값 비교</h4><p class='muted'>같은 재태주수·생후시간 조건에 맞는 문헌을 모두 보여줍니다. 문헌 이름에 마우스를 올리면 원문 위치·대상·인용 문구가 보입니다. "
+         "그래프의 띠는 표에서 위에 있는 문헌(파일 순서)으로 그립니다.</p>",
+         "<table><tr><th>항목</th><th>최근 값</th><th>문헌</th><th>종류</th><th>적용 조건</th><th>기준</th><th>판정</th></tr>"]
+    for x in series:
+        rows = lit_rows(x)
+        if not rows and lit_has(x["key"]):
+            H.append("<tr><td>%s</td><td>%s %s</td><td colspan='5' class='muted'>맞는 문헌 없음</td></tr>" % (_esc(x["label"]), fmt_num(x["v"][-1]), _esc(x["unit"])))
+        for e, kind, cond, rng, jd in rows:
+            cls = "warn" if ("해당" in jd or "범위 위" in jd or "범위 아래" in jd) else ""
+            H.append("<tr><td>%s</td><td>%s %s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td class='%s'>%s</td></tr>" % (
+                _esc(x["label"]), fmt_num(x["v"][-1]), _esc(x["unit"]), lit_src_pop(e), _esc(kind), _esc(cond), _esc(rng), cls, _esc(jd)))
+    H.append("</table>")
+    return "".join(H)
+
+
+def report_html(ctx, res, series, md):
+    s, q = res["summary"], res["parent"]
+    F = {f.fid: f for f in res["facts"]}
+    vd = {v["sid"]: v for v in s["verdicts"]}
+    sp = PROFILE.get("_spec") or {}
+    hrs = (ctx.t0 - ctx.win_start).total_seconds() / 3600.0
+    H = ["<!doctype html><html lang='ko'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>",
+         "<title>NICU 보고서 %s %s</title><style>%s</style></head><body>" % (_esc(ctx.subject_id), _esc(fmt_t(ctx.t0)), REPORT_CSS),
+         "<h1>환자별 NICU 보고서 — 환자 ID %s</h1>" % _esc(ctx.subject_id),
+         "<div class='meta'>요약 기준시각 %s · 집계 %s ~ %s(%s시간) · 명세 %s v%s · stay %s · 기준 자료 ID %s · 생성 %s</div>" % (
+             fmt_t(ctx.t0), fmt_t(ctx.win_start), fmt_t(ctx.t0), fmt_num(round(hrs, 1)), _esc(sp.get("spec_id", "-")), _esc(sp.get("version", "-")),
+             _esc(ctx.stay_id), _esc(res.get("ssot_id", "-")), time.strftime("%Y-%m-%d %H:%M")),
+         "<p class='note'>자동 생성 초안이며 의료진 검토가 필요합니다. <b>밑줄 친 숫자</b>에 마우스를 올리면 그 값을 만든 원자료 행이, "
+         "문장 끝 <b>✔·⚠</b>에 올리면 검증 판정·근거 fact·출처 행이 보입니다. 파란 점선은 원자료 한 행과 일치, 주황 점선은 여러 행으로 계산한 값입니다.</p>",
+         coverage_panel_html(res)]
+    H.append("<h2>1. 1일 요약지 — %s</h2>" % _esc(PROFILE["documents"]["summary"]["title"].replace(" (자동 생성 초안, 의료진 검토 필요)", "")))
+    cur = None
+    for x in s["sents"]:
+        if x["section"] == CDSS_SEC():
+            continue
+        if x["section"] != cur:
+            if cur is not None:
+                H.append("</ul>")
+            cur = x["section"]
+            H.append("<h3>%s</h3><ul class='sents'>" % _esc(SECTIONS.get(cur, cur)))
+        H.append(sentence_html(ctx, x, vd.get(x["sid"]), F))
+    if cur is not None:
+        H.append("</ul>")
+    H.append("<h3>검사 추이(ICU 입실 이후, 기록 2개 이상)</h3>")
+    if series:
+        H.append("<div class='charts'>%s</div>" % "".join("<div class='chart'>%s<div class='cap'>%s</div></div>" % (trend_svg(x), _esc(ref_caption(x))) for x in series))
+        H.append(lit_html(series))
+        tm = trend_markdown(ctx, series)
+        tm = tm[:next((i for i, l in enumerate(tm) if l.startswith("문헌 기준") or l.startswith("- 문헌 기준값")), len(tm))]
+        groups, g = [], []
+        for l in tm + [""]:
+            if l.startswith("|"):
+                g.append(l)
+            elif g:
+                groups.append(g)
+                g = []
+        for g in groups:   # 표마다 따로 변환(붙이면 두 표가 한 표로 합쳐짐)
+            H.append(md_to_html("\n".join(g), "", []).split("<body>", 1)[1].rsplit("</body>", 1)[0])
+    else:
+        H.append("<p class='muted'>기록이 2개 이상인 추이 항목 없음.</p>")
+    H.append("<h2>2. CDSS 알림(규칙 기반 + 트리 모델, 인계문과 별도)</h2>")
+    if res["alerts"]:
+        order = {"high": 0, "medium": 1, "info": 2}
+        H.append("<table><tr><th>심각도</th><th>알림</th><th>내용</th><th>권고 행동(검토 제안)</th><th>근거</th><th>규칙·모델</th><th>참고</th></tr>")
+        for a in sorted(res["alerts"], key=lambda z: order.get(z["severity"], 3)):
+            ev = "".join("<span class='tip num hit' tabindex='0'>%s<span class='pop wide'><b>%s</b> %s%s</span></span> " % (
+                i, i, _esc(F[i].text), _rows_html(raw_rows_of(ctx, F[i]))) for i in a["trigger_fact_ids"] if i in F)
+            H.append("<tr><td class='sev-%s'>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                a["severity"], a["severity"].upper(), _esc(a["title"]), _esc(a["text"]), _esc(a.get("action", "-")), ev, _esc(a["rule_id"]), _esc(a["reference"])))
+        H.append("</table><p class='muted'>권고 행동은 병원 프로토콜 확인을 돕는 검토 제안이며 처방이 아님(프로파일 cdss.actions 에서 수정).</p>")
+    else:
+        H.append("<p>규칙 기반 알림 없음.</p>")
+    sec3 = md.split("## 3. 검증 정보", 1)[1].split("## 4.", 1)[0] if "## 3. 검증 정보" in md else ""
+    H.append("<h2>3. 검증 정보</h2>" + md_to_html(sec3, "", []).split("<body>", 1)[1].rsplit("</body>", 1)[0])
+    H.append("<h2>4. 부모님 요약지(보호자 Daily Briefing, 간호사 확인 전)</h2><div class='brief'>")
+    P = PROFILE["documents"]["parent"]
+    qvd = {v["sid"]: v for v in q["verdicts"]}
+    H.append("<p class='muted'>%s 기준 · 범위 %s</p>" % (_esc(_kor_time(ctx.t0)), "지난 24시간" if hrs >= 23.5 else "입실 후 %s시간" % fmt_num(round(hrs))))
+    for sec, title in PARENT_SECTIONS.items():
+        xs = [x for x in q["sents"] if x["section"] == sec]
+        if not xs:
+            continue
+        H.append("<h3>%s</h3><p>" % _esc(title))
+        for x in xs:
+            v = qvd.get(x["sid"])
+            lab, cls = ("고정 문구", "fix") if x.get("fixed") else VERDICT_KO.get((v or {}).get("label"), ("-", "warn"))
+            cf = [F[c] for c in x.get("cites", []) if c in F]
+            pop = "<b>검증: %s</b>%s" % (lab, "".join("<div class='fact'><b>%s</b> %s</div>%s" % (f.fid, _esc(f.text), _rows_html(raw_rows_of(ctx, f, 6))) for f in cf))
+            H.append("<span class='tip' tabindex='0'>%s<span class='pop wide'>%s</span></span> " % (_esc(_strip_cites(x["text"])), pop))
+        H.append("</p>")
+    H.append("<p class='muted'>%s 기준 자료 ID %s</p></div>" % (_esc(P.get("notice", "")), _esc(res.get("ssot_id", "-"))))
+    H.append("""<script>
+(function(){function place(t){var p=t.querySelector(':scope>.pop');if(!p)return;p.classList.add('fixed');p.style.display='block';
+var r=t.getBoundingClientRect(),w=p.offsetWidth,h=p.offsetHeight,vw=window.innerWidth,vh=window.innerHeight;
+var x=Math.min(Math.max(8,r.left),vw-w-8),y=r.bottom+4;if(y+h>vh-8)y=Math.max(8,r.top-h-4);p.style.left=x+'px';p.style.top=y+'px';}
+function hide(t){var p=t.querySelector(':scope>.pop');if(p){p.style.display='';}}
+document.querySelectorAll('.tip').forEach(function(t){t.addEventListener('mouseenter',function(){place(t)});t.addEventListener('focus',function(){place(t)});
+t.addEventListener('mouseleave',function(){if(document.activeElement!==t)hide(t)});t.addEventListener('blur',function(){hide(t)});});
+window.addEventListener('scroll',function(){document.querySelectorAll('.pop.fixed').forEach(function(p){p.style.display='';});},{passive:true});})();
+</script>""")
+    H.append("</body></html>")
+    return "\n".join(H)
+
+
+def write_report(ctx, res, out_dir):
+    """환자별 통합 보고서를 stay 폴더와 reports/ 폴더에 md·html로 저장. 반환: md 경로"""
+    series = trend_series(ctx)
+    md = report_markdown(ctx, res, series)
+    html = report_html(ctx, res, series, md)
+    rd = os.path.join(out_dir, "reports")
+    os.makedirs(rd, exist_ok=True)
+    base = "report_%s_%s" % (ctx.subject_id, pd.Timestamp(ctx.t0).strftime("%m%d_%H%M"))
+    paths = []
+    for d in (rd, os.path.join(out_dir, "stay_%s_d%d" % (ctx.stay_id, ctx.day_index))):
+        os.makedirs(d, exist_ok=True)
+        for ext, body in (("md", md), ("html", html)):
+            p = os.path.join(d, "%s.%s" % (base if d == rd else "report", ext))
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            paths.append(p)
+    return paths[0]
+
+
 # =============================================================================
 # 8. 실행·감사 로그
 # =============================================================================
@@ -3344,6 +4512,9 @@ class Pipeline(object):
             prof = spec_to_profile(prof, load_spec(spec), spec)
             validate_profile(prof)
         apply_profile(prof)
+        load_ref_lit(os.environ.get("KCD_REF_LIT") or PROFILE.get("ref_literature"))   # 생략 시 같은 폴더의 neonatal_ref_literature.json
+        if verbose:
+            print("[ref] 문헌 기준값 %s" % ("%d개 (%s)" % (len(REF_LIT["entries"]), os.path.basename(REF_LIT["path"])) if REF_LIT["entries"] else "없음 → 프로파일 고정 범위 사용"))
         if verbose and PROFILE.get("_spec"):
             S = PROFILE["_spec"]
             print("[spec] %s v%s (%s): 영역 %d개, 필수 요소 %d개" % (S["spec_id"], S["version"], os.path.basename(S["path"] or ""), len(S["required_information"]),
@@ -3428,10 +4599,16 @@ class Pipeline(object):
         facts = build_facts(ctx)
         audit.log("build_facts", {"stay_id": stay_id, "t0": str(ctx.t0), "day": ctx.day_index}, {"n_facts": len(facts), "n_must": sum(f.must for f in facts)}, time.time() - t1)
         alerts = run_cdss(ctx, facts, self.dur)
+        if not getattr(self, "_births", None):
+            S = dict(SAMPLING_DEFAULT)
+            S.update(PROFILE.get("sampling", {}))
+            self._births = birth_times(self, S)
+        ctx.birth, ctx.birth_src = self._births.get(str(stay_id), (None, "출생 시각 확인 불가"))
+        risk_alerts(ctx, facts, alerts, ctx.birth)
         finalize_facts(ctx, facts, alerts)
         audit.log("cdss", {"facts": [f.fid for f in facts]}, {"alerts": [a["rule_id"] for a in alerts]})
         judge = llm if (llm is not None and llm.ok) else None
-        res = {"ctx": ctx, "facts": facts, "alerts": alerts}
+        res = {"ctx": ctx, "facts": facts, "alerts": alerts, "ssot_id": ssot_id(ctx, facts)}
         allm = {"stay_id": stay_id, "day": ctx.day_index, "mode": mode, "n_facts": len(facts), "neonate": ctx.is_neonate}
         for doc in docs:
             sents, stats = self.render(ctx, facts, alerts, doc, mode, llm, audit)
@@ -3452,13 +4629,22 @@ class Pipeline(object):
                     with open(os.path.join(sd, "summary_%s.md" % mode), "w", encoding="utf-8") as f:
                         f.write(note_markdown(ctx, sents, vd, cov, checklist=chk, doc="summary"))
                 else:
-                    with open(os.path.join(sd, "parent_%s.md" % mode), "w", encoding="utf-8") as f:
-                        f.write(note_markdown(ctx, sents, doc="parent", show_cites=False))
-                    with open(os.path.join(sd, "parent_%s_verify.md" % mode), "w", encoding="utf-8") as f:
-                        f.write(note_markdown(ctx, sents, vd, cov, checklist=chk, doc="parent", extra_metrics=m))
+                    sid_ = res["ssot_id"]
+                    pp, pv = os.path.join(sd, "parent_%s.md" % mode), os.path.join(sd, "parent_%s_nurse_check.md" % mode)
+                    old = [supersede(pp, sid_), supersede(pv, sid_)]
+                    with open(pp, "w", encoding="utf-8") as f:
+                        f.write(parent_markdown(ctx, sents, facts, alerts, sid_=sid_))
+                    with open(pv, "w", encoding="utf-8") as f:
+                        f.write(parent_markdown(ctx, sents, facts, alerts, vd, cov, nurse=True, sid_=sid_, metrics_=m))
+                    with open(os.path.join(sd, "parent_%s_meta.json" % mode), "w", encoding="utf-8") as f:
+                        json.dump({"ssot_id": sid_, "status": "간호사 확인 전 초안", "auto_send": False, "superseded": [x for x in old if x],
+                                   "doctor_flags": [{"item": t, "facts": ids} for t, ids in doctor_flags(ctx, facts, alerts)]}, f, ensure_ascii=False, indent=1)
                 with open(os.path.join(sd, "verify_%s_%s.json" % (doc, mode)), "w", encoding="utf-8") as f:
                     json.dump({"metrics": m, "verdicts": vd, "coverage": cov, "checklist": chk, "sentences": sents}, f, ensure_ascii=False, indent=1, default=str)
         allm["secs"] = round(time.time() - t1, 2)
+        allm["ssot_id"] = res["ssot_id"]
+        if sd and write and all(d in res for d in DOCS):
+            res["report"] = write_report(ctx, res, out_dir)
         if sd and write:
             with open(os.path.join(sd, "factsheet.json"), "w", encoding="utf-8") as f:
                 json.dump({"stay_id": stay_id, "hadm_id": ctx.hadm_id, "t0": str(ctx.t0), "window_start": str(ctx.win_start), "day": ctx.day_index,
@@ -3526,7 +4712,9 @@ def cmd_run(a):
         r = p.process(sid, day, a.out, mode=a.mode, llm=llm if llm.ok else None)
         s, q = r["summary"], r["parent"]
         print("\n" + note_markdown(r["ctx"], s["sents"], s["verdicts"], s["coverage"], checklist=s["checklist"], doc="summary"))
-        print("\n" + note_markdown(r["ctx"], q["sents"], doc="parent", show_cites=False))
+        print("\n" + parent_markdown(r["ctx"], q["sents"], r["facts"], r["alerts"], sid_=r["ssot_id"]))
+        if r.get("report"):
+            print("[report] %s (html 같은 이름)" % r["report"])
         print("[metrics]", json.dumps(r["metrics"], ensure_ascii=False))
         print("[out] %s" % os.path.join(a.out, "stay_%s_d%d" % (sid, r["ctx"].day_index)))
 
@@ -3963,12 +5151,432 @@ def cmd_sample(a):
     print("주의: nicu_sample.csv 에는 person_id 와 날짜가 있으므로 분석환경 밖으로 반출하지 마세요. 외부 공유는 sample_flow.csv 집계만.")
 
 
+# =============================================================================
+# 10. 트리 모델 CDSS: (1) 환자 악화 조기경보 (2) 검사치 임계치 알림
+#   학습: python kcd_nicu.py train-risk --data "DIR/*" --out risk_models   (분석환경 안에서만)
+#   추론: run 시 risk_models/ 에 모델이 있으면 CDSS 장에 예측 위험·주요 요인·권고 행동을 추가
+#   시점 = 매일 07:00(1일 요약 기준 시각), 입력 = 직전 24시간(검사는 48시간) 기록, 예측 = 다음 24시간
+# =============================================================================
+
+RISK_MODEL_DIR = "risk_models"
+RISK_TASKS = OrderedDict([
+    ("deterioration", {"title": "환자 악화 조기경보", "label": "다음 24시간 안에 사망·새 침습적 인공호흡·승압제 신규 시작 중 하나"}),
+    ("critical_lab", {"title": "검사치 임계치 알림", "label": "다음 24시간 안에 검사 위험값(K·Na·혈당·빌리루빈·Hb·혈소판·pH 등) 발생"}),
+])
+RISK_VITALS = [("hr", "심박수"), ("rr", "호흡수"), ("spo2", "SpO2"), ("temp", "체온"), ("sbp", "수축기혈압"), ("map", "평균혈압")]
+RISK_LABS = [("cr", "Cr"), ("k", "K"), ("na", "Na"), ("glucose", "혈당"), ("tbil", "빌리루빈"), ("crp", "CRP"), ("hb", "Hb"), ("plt", "혈소판"),
+             ("wbc", "백혈구"), ("ph", "pH"), ("pco2", "pCO2"), ("lactate", "Lactate")]
+RISK_MEDS = [("vasopressor", "승압제"), ("sedation", "진정제"), ("antibiotic", "항생제"), ("insulin", "인슐린"),
+             ("respiratory_stimulant", "카페인"), ("nutrition", "정맥영양")]
+
+
+def risk_feature_names():
+    n = []
+    for k, _ in RISK_VITALS:
+        n += ["%s_min" % k, "%s_max" % k, "%s_mean" % k, "%s_last" % k, "%s_n" % k]
+    n += ["desat_n", "brady_n", "tachy_n", "temp_low_n", "temp_high_n", "resp_level", "fio2_last"]
+    for k, _ in RISK_LABS:
+        n += ["%s_last" % k, "%s_delta" % k]
+    n += ["bst_min", "bst_max", "hours_since_lab", "weight_kg", "weight_pct", "intake_ml_kg_day", "urine_ml_kg_h"]
+    n += ["med_%s" % k for k, _ in RISK_MEDS]
+    n += ["age_days", "icu_day", "preterm"]
+    return n
+
+
+RISK_FEATURE_KO = {"desat_n": "SpO2 85% 미만 횟수", "brady_n": "HR 100 미만 횟수", "tachy_n": "HR 180 초과 횟수", "temp_low_n": "저체온 횟수",
+                   "temp_high_n": "고체온 횟수", "resp_level": "호흡 보조 단계", "fio2_last": "최근 FiO2", "bst_min": "BST 최저", "bst_max": "BST 최고",
+                   "hours_since_lab": "마지막 검사 후 경과 시간", "weight_kg": "체중", "weight_pct": "입실 후 체중 변화율", "intake_ml_kg_day": "섭취 mL/kg/일",
+                   "urine_ml_kg_h": "소변 mL/kg/h", "age_days": "생후일", "icu_day": "NICU 재실일", "preterm": "미숙아 진단"}
+for _k, _ko in RISK_VITALS:
+    for _s, _sko in (("min", "최저"), ("max", "최고"), ("mean", "평균"), ("last", "최근"), ("n", "기록 수")):
+        RISK_FEATURE_KO["%s_%s" % (_k, _s)] = "%s %s" % (_ko, _sko)
+for _k, _ko in RISK_LABS:
+    RISK_FEATURE_KO["%s_last" % _k] = "%s 최근값" % _ko
+    RISK_FEATURE_KO["%s_delta" % _k] = "%s 변화량" % _ko
+for _k, _ko in RISK_MEDS:
+    RISK_FEATURE_KO["med_%s" % _k] = "%s 투여" % _ko
+
+
+def _arr(df, by_concept=True):
+    import numpy as np
+    out = {}
+    if df is None or df.empty or "t" not in df.columns:
+        return out
+    d = df.dropna(subset=["t"])
+    if by_concept:
+        d = d.dropna(subset=["concept"]) if "concept" in d.columns else d
+        for c, g in d.groupby("concept"):
+            g = g.sort_values("t")
+            out[c] = (g["t"].values.astype("datetime64[ns]"), to_num(g["v"]).values.astype(float) if "v" in g.columns else np.zeros(len(g)))
+    return out
+
+
+def ctx_arrays(ctx):
+    """StayContext → 개념별 (시각, 값) 배열. 학습·추론이 같은 함수를 씀."""
+    import numpy as np
+    A = {"chart": _arr(ctx.chart), "lab": _arr(ctx.lab), "out": _arr(ctx.out)}
+    if not ctx.inp.empty:
+        d = ctx.inp.dropna(subset=["t"]).sort_values("t")
+        A["inp"] = (d["t"].values.astype("datetime64[ns]"), to_num(d["v"]).fillna(0).values.astype(float))
+    else:
+        A["inp"] = (np.array([], dtype="datetime64[ns]"), np.array([]))
+    modes = ctx.chart[(ctx.chart["concept"] == "vent_mode")].dropna(subset=["t"]).sort_values("t") if not ctx.chart.empty else ctx.chart
+    A["mode"] = (modes["t"].values.astype("datetime64[ns]"), modes["value"].astype(str).values) if len(modes) else (np.array([], dtype="datetime64[ns]"), np.array([]))
+    vent = ctx.chart[ctx.chart["concept"].isin(VENT_CONCEPTS)].dropna(subset=["t"]).sort_values("t") if not ctx.chart.empty else ctx.chart
+    A["vent_t"] = vent["t"].values.astype("datetime64[ns]") if len(vent) else np.array([], dtype="datetime64[ns]")
+    A["emar"] = {}
+    if not ctx.emar.empty:
+        for c, g in ctx.emar.dropna(subset=["t"]).groupby("cls"):
+            A["emar"][c] = np.sort(g["t"].values.astype("datetime64[ns]"))
+    if not ctx.inp.empty and (ctx.inp["concept"] == "in_vasopressor").any():
+        extra = ctx.inp[ctx.inp["concept"] == "in_vasopressor"]["t"].dropna().values.astype("datetime64[ns]")
+        A["emar"]["vasopressor"] = np.sort(np.concatenate([A["emar"].get("vasopressor", np.array([], dtype="datetime64[ns]")), extra]))
+    intub = ctx.proc[ctx.proc["label"].astype(str).str.contains(r"intubat|삽관", case=False, regex=True, na=False)] if not ctx.proc.empty else ctx.proc
+    A["intub_t"] = np.sort(intub["t"].dropna().values.astype("datetime64[ns]")) if len(intub) else np.array([], dtype="datetime64[ns]")
+    w = []
+    if not ctx.chart.empty:
+        x = ctx.chart[ctx.chart["concept"] == "weight"].dropna(subset=["v", "t"]).sort_values("t")
+        w = [(t, kg(v)) for t, v in zip(x["t"], x["v"])]
+    if not w and not ctx.inp.empty and "patientweight" in ctx.inp.columns:
+        x = ctx.inp.assign(_w=to_num(ctx.inp["patientweight"])).dropna(subset=["_w", "t"]).sort_values("t")
+        w = [(t, kg(v)) for t, v in zip(x["t"], x["_w"])]
+    w = [(t, v) for t, v in w if 0.2 <= v <= 300]
+    A["weight"] = (np.array([pd.Timestamp(t).to_datetime64() for t, _ in w], dtype="datetime64[ns]"), np.array([v for _, v in w], dtype=float))
+    adm = ctx.adm.iloc[0] if len(ctx.adm) else {}
+    dt_ = to_dt(pd.Series([adm.get("deathtime") if hasattr(adm, "get") else None])).iloc[0]
+    A["death"] = pd.Timestamp(dt_) if pd.notna(dt_) else None
+    codes = ctx.dx["icd_code"].astype(str).str.replace(".", "", regex=False).str.upper() if not ctx.dx.empty and "icd_code" in ctx.dx.columns else pd.Series(dtype=str)
+    A["preterm"] = float(codes.str.startswith("P07").any())
+    return A
+
+
+def _win(tv, a, b):
+    import numpy as np
+    t, v = tv
+    i = np.searchsorted(t, np.datetime64(a), side="right")
+    j = np.searchsorted(t, np.datetime64(b), side="right")
+    return t[i:j], v[i:j]
+
+
+def _cnt(t, a, b):
+    import numpy as np
+    return int(np.searchsorted(t, np.datetime64(b), side="right") - np.searchsorted(t, np.datetime64(a), side="right"))
+
+
+def risk_features(A, t0, intime, birth):
+    import numpy as np
+    nan = float("nan")
+    a24, a48 = t0 - pd.Timedelta(hours=24), t0 - pd.Timedelta(hours=48)
+    f = []
+    ch = A["chart"]
+    vals = {}
+    for k, _ in RISK_VITALS:
+        _, v = _win(ch[k], a24, t0) if k in ch else (None, np.array([]))
+        v = v[~np.isnan(v)] if len(v) else v
+        vals[k] = v
+        f += ([float(v.min()), float(v.max()), float(v.mean()), float(v[-1]), float(len(v))] if len(v) else [nan, nan, nan, nan, 0.0])
+    N = PROFILE["neonatal"]
+    sp, hr, tp = vals["spo2"], vals["hr"], vals["temp"]
+    f += [float((sp < N["desat_spo2"]).sum()) if len(sp) else 0.0, float((hr < N["brady_hr"]).sum()) if len(hr) else 0.0,
+          float((hr > N["vitals_normal"]["hr"][1]).sum()) if len(hr) else 0.0,
+          float((tp < N["vitals_normal"]["temp"][0]).sum()) if len(tp) else 0.0, float((tp > N["vitals_normal"]["temp"][1]).sum()) if len(tp) else 0.0]
+    f.append(float(resp_level_at(A, t0)))
+    _, fi = _win(ch["fio2"], a24, t0) if "fio2" in ch else (None, np.array([]))
+    f.append(float(fi[-1] if fi[-1] > 1 else fi[-1] * 100) if len(fi) and not np.isnan(fi[-1]) else nan)
+    lb = A["lab"]
+    last_lab = None
+    for k, _ in RISK_LABS:
+        if k in lb:
+            t, v = _win(lb[k], a48, t0)
+            t2, v2 = _win(lb[k], t0 - pd.Timedelta(hours=120), t0)
+            f += [float(v[-1]) if len(v) else nan, float(v2[-1] - v2[-2]) if len(v2) >= 2 and len(v) else nan]
+            if len(t):
+                last_lab = t[-1] if last_lab is None or t[-1] > last_lab else last_lab
+        else:
+            f += [nan, nan]
+    _, b = _win(ch["bst"], a24, t0) if "bst" in ch else (None, np.array([]))
+    f += [float(b.min()) if len(b) else nan, float(b.max()) if len(b) else nan]
+    f.append(float((np.datetime64(t0) - last_lab) / np.timedelta64(1, "h")) if last_lab is not None else nan)
+    wt, wv = A["weight"]
+    i = np.searchsorted(wt, np.datetime64(t0), side="right")
+    wk = float(wv[i - 1]) if i > 0 else nan
+    w0 = wv[np.searchsorted(wt, np.datetime64(intime), side="left")] if len(wt) and np.searchsorted(wt, np.datetime64(intime)) < i else nan
+    f += [wk, float((wk - w0) / w0 * 100) if (i > 0 and not np.isnan(w0) and w0) else nan]
+    _, iv = _win(A["inp"], a24, t0)
+    _, uv = _win(A["out"]["urine"], a24, t0) if "urine" in A["out"] else (None, np.array([]))
+    f += [float(np.nansum(iv) / wk) if (len(iv) and wk == wk and wk) else nan, float(np.nansum(uv) / wk / 24.0) if (len(uv) and wk == wk and wk) else nan]
+    for k, _ in RISK_MEDS:
+        t = A["emar"].get(k)
+        f.append(float(_cnt(t, a24, t0) > 0) if t is not None else 0.0)
+    f += [float((t0 - birth).total_seconds() / 86400.0) if birth is not None else nan, float((t0 - intime).total_seconds() / 86400.0), A["preterm"]]
+    return f
+
+
+def resp_level_at(A, t0, hours=12):
+    """0 없음, 1 산소, 2 비침습, 3 침습(모드 미상 포함)."""
+    import numpy as np
+    a = t0 - pd.Timedelta(hours=hours)
+    if _cnt(A["vent_t"], a, t0):
+        mt, mv = A["mode"]
+        i = np.searchsorted(mt, np.datetime64(t0), side="right")
+        j = np.searchsorted(mt, np.datetime64(a), side="right")
+        mode = str(mv[i - 1]) if i > j else None
+        return 2 if resp_kind(mode, []) == "noninvasive" else 3
+    ch = A["chart"]
+    if "o2_flow" in ch:
+        _, v = _win(ch["o2_flow"], a, t0)
+        if len(v) and np.nanmax(v) > 0:
+            return 1
+    return 0
+
+
+def risk_labels(A, t0):
+    """다음 24시간 라벨. 반환 dict(deterioration, critical_lab, 세부)."""
+    import numpy as np
+    b = t0 + pd.Timedelta(hours=24)
+    death = A["death"] is not None and t0 < A["death"] <= b
+    lvl = resp_level_at(A, t0)
+    mt, mv = A["mode"]
+    _, fm = _win((mt, mv), t0, b) if len(mt) else (None, np.array([]))
+    inv_future = any(resp_kind(str(m), []) == "invasive" for m in fm) or _cnt(A["intub_t"], t0, b) > 0
+    new_inv = bool(inv_future and lvl < 3)
+    vt = A["emar"].get("vasopressor")
+    new_vaso = bool(vt is not None and _cnt(vt, t0, b) > 0 and _cnt(vt, t0 - pd.Timedelta(hours=24), t0) == 0)
+    crit = {}
+    lb = A["lab"]
+    for c, (lo, hi) in PROFILE["critical_values"].items():
+        if c in lb:
+            _, v = _win(lb[c], t0, b)
+            v = v[~np.isnan(v)]
+            if len(v) and ((lo is not None and (v <= lo).any()) or (hi is not None and (v >= hi).any())):
+                crit[c] = True
+    gl = PROFILE["neonatal"]["glucose_low"]
+    for src in (lb.get("glucose"), A["chart"].get("bst")):
+        if src is not None:
+            _, v = _win(src, t0, b)
+            if len(v) and (v[~np.isnan(v)] < gl).any():
+                crit["glucose_low"] = True
+    if "tbil" in lb:
+        _, v = _win(lb["tbil"], t0, b)
+        if len(v) and (v >= PROFILE["neonatal"]["tsb_alert_mg_dl"]).any():
+            crit["tbil_high"] = True
+    measured = any(_cnt(lb[c][0], t0, b) for c in lb) if lb else False
+    return {"deterioration": int(death or new_inv or new_vaso), "critical_lab": int(bool(crit)), "death": int(death), "new_invasive": int(new_inv),
+            "new_vasopressor": int(new_vaso), "crit_types": ",".join(sorted(crit)), "lab_measured_next24": int(measured)}
+
+
+def build_risk_dataset(a):
+    """폴더별로 NICU stay 를 읽어 (stay-일) 특징·라벨 표 생성. 직전 24시간이 같은 재실 안이고 다음 24시간 관찰 가능한 시점만."""
+    S = dict(SAMPLING_DEFAULT)
+    rows, names = [], risk_feature_names()
+    dirs = expand_dirs(a.data)
+    for di, d in enumerate(dirs, 1):
+        try:
+            p = Pipeline(d, a.dur_csv, verbose=False, profile=a.profile, cohort=a.cohort, spec=a.spec)
+        except SystemExit:
+            continue
+        S.update(PROFILE.get("sampling", {}))
+        births = birth_times(p, S)
+        p.preload(p.cands["stay_id"].tolist())
+        for _, r in p.cands.iterrows():
+            ctx = StayContext(p.kd, r, p.item_map, p.lab_map, p.d_test)
+            A = ctx_arrays(ctx)
+            b, _src = births.get(r["stay_id"], (None, None))
+            intime, outtime = pd.Timestamp(r["intime_dt"]), pd.Timestamp(r["outtime_dt"])
+            for t0 in day_t0s(r):
+                if t0.hour != int(PROFILE["daily"]["cutoff_hour"]) or t0.minute:
+                    continue
+                if (t0 - intime).total_seconds() < 24 * 3600:
+                    continue
+                if A["death"] is not None and A["death"] <= t0:
+                    continue
+                lab = risk_labels(A, t0)
+                if t0 + pd.Timedelta(hours=24) > outtime and not lab["death"]:
+                    continue  # 다음 24시간을 관찰할 수 없음(퇴실)
+                if b is not None and (t0 - b).days > int(S.get("max_age_days", 28)) and a.cohort == "nicu":
+                    continue
+                feats = risk_features(A, t0, intime, b)
+                rows.append(dict(zip(names, feats), person_id=r["subject_id"], stay_id=r["stay_id"], data_dir=d, t0=str(t0), **lab))
+        print("[train-risk] 폴더 %d/%d %s: 누적 %d 시점" % (di, len(dirs), os.path.basename(os.path.normpath(d)), len(rows)))
+    return pd.DataFrame(rows), names
+
+
+def _metrics(y, p):
+    import numpy as np
+    from sklearn.metrics import roc_auc_score, average_precision_score, brier_score_loss
+    m = {"n": int(len(y)), "positives": int(np.sum(y)), "prevalence": round(float(np.mean(y)), 4)}
+    if len(set(y)) > 1:
+        m.update(auroc=round(float(roc_auc_score(y, p)), 4), auprc=round(float(average_precision_score(y, p)), 4))
+    m["brier"] = round(float(brier_score_loss(y, p)), 4)
+    return m
+
+
+def cmd_train_risk(a):
+    try:
+        import numpy as np
+        import joblib
+        from sklearn.ensemble import HistGradientBoostingClassifier
+        from sklearn.model_selection import GroupShuffleSplit
+        from sklearn.inspection import permutation_importance
+    except ImportError:
+        raise SystemExit("scikit-learn 이 없습니다. offline_wheels_ml 폴더로 설치하세요:\n"
+                         "  python -m pip install --no-index --find-links offline_wheels_ml scikit-learn")
+    df, names = build_risk_dataset(a)
+    os.makedirs(a.out, exist_ok=True)
+    if df.empty:
+        raise SystemExit("학습 가능한 시점이 없습니다.")
+    df.drop(columns=["person_id", "stay_id", "data_dir"]).to_csv(os.path.join(a.out, "risk_dataset_features_only.csv"), index=False)
+    report = ["# 트리 모델 CDSS 학습 결과", "", "- 생성: %s, kcd_nicu.py v%s" % (time.strftime("%Y-%m-%d %H:%M"), VERSION),
+              "- 데이터: 폴더 %d개, stay-일 %d개, 환아 %d명" % (df["data_dir"].nunique(), len(df), df["person_id"].nunique()),
+              "- 시점: 매일 %02d:00, 입력 직전 24시간(검사 48시간), 예측 다음 24시간. 학습·평가는 환자 단위 8:2 분할" % int(PROFILE["daily"]["cutoff_hour"]), ""]
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=a.seed)
+    tr, te = next(gss.split(df, groups=df["person_id"]))
+    X = df[names].astype(float).values
+    for task, info in RISK_TASKS.items():
+        y = df[task].values.astype(int)
+        report += ["## %s" % info["title"], "", "- 정의: %s" % info["label"], "- 양성: 전체 %d / %d (%.1f%%)" % (y.sum(), len(y), 100 * y.mean())]
+        if y[tr].sum() < 5 or len(set(y[te])) < 2:
+            report += ["- 양성 사례가 너무 적어 학습하지 않음(학습 양성 %d, 평가 양성 %d)" % (y[tr].sum(), y[te].sum()), ""]
+            continue
+        clf = HistGradientBoostingClassifier(max_depth=4, learning_rate=0.05, max_iter=400, l2_regularization=1.0, min_samples_leaf=40,
+                                             early_stopping=True, validation_fraction=0.15, class_weight="balanced", random_state=a.seed)
+        clf.fit(X[tr], y[tr])
+        pte, ptr = clf.predict_proba(X[te])[:, 1], clf.predict_proba(X[tr])[:, 1]
+        cut = float(np.quantile(ptr, 1 - a.alert_top))
+        flag = pte >= cut
+        sens = float(flag[y[te] == 1].mean()) if (y[te] == 1).any() else float("nan")
+        ppv = float(y[te][flag].mean()) if flag.any() else float("nan")
+        m = _metrics(y[te], pte)
+        m.update(threshold=round(cut, 4), alert_top=a.alert_top, sensitivity=round(sens, 4), ppv=round(ppv, 4), alert_rate=round(float(flag.mean()), 4))
+        pi = permutation_importance(clf, X[te], y[te], scoring="roc_auc", n_repeats=3, random_state=a.seed)
+        imp = sorted(zip(names, pi.importances_mean), key=lambda x: -x[1])
+        med = {n: (float(np.nanmedian(X[tr][:, i])) if np.isfinite(X[tr][:, i]).any() else None) for i, n in enumerate(names)}
+        bins = pd.qcut(pd.Series(pte), 5, duplicates="drop")
+        cal = pd.DataFrame({"p": pte, "y": y[te], "bin": bins}).groupby("bin", observed=True).agg(pred=("p", "mean"), obs=("y", "mean"), n=("y", "size"))
+        joblib.dump(clf, os.path.join(a.out, "%s.joblib" % task))
+        meta = {"task": task, "title": info["title"], "label": info["label"], "features": names, "medians": med, "threshold": cut, "metrics": m,
+                "top_features": [n for n, v in imp[:15]], "train_quantiles": [float(x) for x in np.quantile(ptr, np.linspace(0, 1, 101))],
+                "created": time.strftime("%Y-%m-%d %H:%M"), "code_version": VERSION, "sklearn": __import__("sklearn").__version__}
+        with open(os.path.join(a.out, "%s_meta.json" % task), "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, ensure_ascii=False, indent=1)
+        report += ["- 평가(환자 %d명, 시점 %d개): AUROC %s, AUPRC %s, Brier %s" % (df.iloc[te]["person_id"].nunique(), len(te), m.get("auroc"), m.get("auprc"), m["brier"]),
+                   "- 경보 기준: 학습 예측 상위 %d%%(위험 %.1f%% 이상) → 평가 경보율 %.1f%%, 민감도 %.1f%%, 양성예측도 %.1f%%" % (
+                       round(a.alert_top * 100), cut * 100, m["alert_rate"] * 100, sens * 100, ppv * 100), "",
+                   "보정(예측 5분위)", "", "| 구간 | 평균 예측 | 실제 비율 | 시점 수 |", "|---|---|---|---|"]
+        report += ["| %s | %.3f | %.3f | %d |" % (i + 1, r_.pred, r_.obs, r_.n) for i, r_ in enumerate(cal.itertuples())]
+        report += ["", "주요 입력(순열 중요도, AUROC 감소량)", "", "| 순위 | 입력 | 중요도 |", "|---|---|---|"]
+        report += ["| %d | %s | %.4f |" % (i + 1, RISK_FEATURE_KO.get(n, n), v) for i, (n, v) in enumerate(imp[:12])]
+        report.append("")
+        print("[train-risk] %s: AUROC %s, AUPRC %s, 양성 %d" % (info["title"], m.get("auroc"), m.get("auprc"), y.sum()))
+    sub = df[["death", "new_invasive", "new_vasopressor", "lab_measured_next24"]].sum().to_dict()
+    report += ["## 라벨 세부(전체 시점 수)", "", "- 사망 %d, 새 침습적 인공호흡 %d, 승압제 신규 %d, 다음 24시간 검사 시행 %d" % (
+        sub["death"], sub["new_invasive"], sub["new_vasopressor"], sub["lab_measured_next24"]), "",
+               "- 한계: 라벨은 구조화 기록으로 정의한 대리 결과이며, 외부 검증 전에는 임상 의사결정에 단독으로 쓰지 않음."]
+    with open(os.path.join(a.out, "train_report.md"), "w", encoding="utf-8") as fh:
+        fh.write("\n".join(report) + "\n")
+    print("[train-risk] 저장: %s/(deterioration|critical_lab).joblib, *_meta.json, train_report.md" % a.out)
+
+
+_RISK_CACHE = {}
+
+
+def load_risk_models():
+    if "models" in _RISK_CACHE:
+        return _RISK_CACHE["models"]
+    out = {}
+    d = next((x for x in (os.environ.get("KCD_RISK_DIR"), os.path.join(os.getcwd(), RISK_MODEL_DIR),
+                          os.path.join(os.path.dirname(os.path.abspath(__file__)), RISK_MODEL_DIR)) if x and os.path.isdir(x)), None)
+    if d:
+        try:
+            import joblib
+            for task in RISK_TASKS:
+                mp, jp = os.path.join(d, task + ".joblib"), os.path.join(d, task + "_meta.json")
+                if os.path.exists(mp) and os.path.exists(jp):
+                    out[task] = (joblib.load(mp), json.load(open(jp, encoding="utf-8")))
+        except ImportError:
+            print("[risk] scikit-learn 이 없어 트리 모델 경보를 건너뜀")
+    _RISK_CACHE["models"] = out
+    return out
+
+
+def risk_alerts(ctx, facts, alerts, birth=None):
+    """트리 모델 예측을 CDSS 알림으로 추가. 예측값·기준값은 파생 fact로 등록해 검증기 대조 대상에 포함."""
+    import numpy as np
+    models = load_risk_models()
+    if not models:
+        return
+    A = ctx_arrays(ctx)
+    x = np.array([risk_features(A, ctx.t0, ctx.intime, birth)], dtype=float)
+    for task, (clf, meta) in models.items():
+        names = meta["features"]
+        if names != risk_feature_names():
+            continue
+        p = float(clf.predict_proba(x)[0, 1])
+        contrib = []
+        for n in meta["top_features"][:10]:
+            i = names.index(n)
+            if not np.isfinite(x[0, i]) or meta["medians"].get(n) is None:
+                continue
+            x2 = x.copy()
+            x2[0, i] = meta["medians"][n]
+            d = p - float(clf.predict_proba(x2)[0, 1])
+            if d > 0.005:
+                contrib.append((d, n, x[0, i]))
+        contrib.sort(reverse=True)
+        why = ", ".join("%s %s" % (RISK_FEATURE_KO.get(n, n), fmt_num(round(v, 2))) for d, n, v in contrib[:3]) or "뚜렷한 단일 요인 없음"
+        pct = int(np.searchsorted(meta["train_quantiles"], p) - 1)
+        txt = "%s 예측 위험 %s%%(경보 기준 %s%%, 학습 분포 상위 %d%%). 주요 요인: %s." % (meta["title"], fmt_num(round(p * 100, 1)), fmt_num(round(meta["threshold"] * 100, 1)),
+                                                                     max(1, 100 - pct), why)
+        f = Fact("model_" + task, CDSS_SEC(), txt, 1, concepts={"model_" + task}, key_nums=[round(p * 100, 1)], prov=[{"derived_from": "tree_model", "model": task}])
+        f.fid = "F%03d" % (len(facts) + 1)
+        facts.append(f)
+        hi = p >= meta["threshold"]
+        alerts.append({"alert_id": "AL%02d" % (len(alerts) + 1), "rule_id": "MODEL_" + task.upper(), "severity": "high" if hi else "info",
+                       "title": meta["title"] + (" 경보" if hi else "(경보 기준 미만)"), "text": txt, "trigger_fact_ids": [f.fid],
+                       "reference": "트리 모델(GBM), 평가 AUROC %s" % meta["metrics"].get("auroc"), "parent_visible": False,
+                       "action": cdss_action("MODEL_" + task.upper()) if hi else "현재 모델 경보 기준 미만. 규칙 알림과 임상 판단을 우선함."})
+
+
+CDSS_ACTIONS_DEFAULT = {
+    "NEO_HYPOGLYCEMIA": "30분 안에 혈당 재측정, 당 주입 속도(GIR)와 수유 확인, 기준 미만이 지속되면 담당의 보고.",
+    "NEO_HYPERGLYCEMIA": "당 주입 속도와 수액 농도 확인, 재측정 후 지속 시 담당의 보고.",
+    "NEO_TEMP_INSTABILITY": "인큐베이터·보온기 설정 확인 후 30~60분 뒤 체온 재측정, 발열이면 감염 징후 함께 평가.",
+    "NEO_TACHYCARDIA": "통증·발열·저혈량 여부 확인, 지속 시 담당의 보고.",
+    "NEO_TACHYPNEA": "호흡 양상·SpO2 재평가, 호흡 보조 조정 필요성 담당의와 상의.",
+    "NEO_DESAT_BRADY": "사건 시각·중재 강도 기록, 카페인 투여·호흡 보조 설정 검토를 담당의와 상의.",
+    "NEO_WEIGHT_LOSS": "수유량·수액량 재계산, 영양 계획을 담당의·영양팀과 검토.",
+    "NEO_FLUID_RANGE": "실제 섭취량과 목표 수분량 비교, 수액·수유 계획 재확인.",
+    "NEO_OLIGURIA": "기저귀 무게·도뇨 확인으로 소변량 재측정, 지속 시 수분 상태와 신기능 평가 요청.",
+    "NEO_BILI_HIGH": "재태주수·생후시간별 광선치료 기준표와 비교, 광선치료 시작·강화 여부 담당의 확인.",
+    "NEO_BILI_RISE": "빌리루빈 추적 간격 단축, 용혈 검사 필요성 담당의와 상의.",
+    "NEO_SEPSIS_MARKERS": "감염 징후 재평가, 배양 결과와 항생제 계획을 담당의와 확인.",
+    "CRITICAL_LAB": "검체 오류 여부 확인 후 재검, 결과 즉시 담당의 보고.",
+    "AKI_KDIGO": "소변량·수분 균형 확인, 신독성 약물 검토와 용량 조절 필요성 상의.",
+    "PRESSOR_ACTIVE": "혈압·관류 지표 확인 간격 유지, 주입 라인·속도 재확인.",
+    "TDM_MISSING": "다음 투여 전 혈중농도 채혈 필요성 담당의·약제부와 확인.",
+    "LINE_DAYS": "중심정맥관 유지 필요성 검토, 삽입부 관찰과 관리 지침 준수 확인.",
+    "MICRO_PENDING": "결과 확인 시각 정하고 인계에 포함.",
+    "ABX_MISMATCH": "감수성 결과와 현재 항생제 비교 후 변경 필요성 담당의 즉시 상의.",
+    "DUR_PAIR": "병용금기 여부 약제부 확인 후 처방 재검토.",
+    "MODEL_DETERIORATION": "활력징후·호흡 상태 관찰 간격 단축, 담당의에게 모델 경보와 주요 요인 공유 후 재평가.",
+    "MODEL_CRITICAL_LAB": "다음 검사 결과 확인 시각을 정하고, 주요 요인 항목(전해질·혈당 등) 재측정 필요성 확인.",
+}
+
+
+def cdss_action(rule):
+    acts = dict(CDSS_ACTIONS_DEFAULT, **(PROFILE.get("cdss", {}).get("actions", {}) if PROFILE else {}))
+    for k, v in acts.items():
+        if rule == k or rule.startswith(k):
+            return v
+    return "담당의와 상의."
+
+
 def kcd_main(argv=None):
     if isinstance(argv, str):
         argv = argv.split()
     ap = argparse.ArgumentParser(description="K-MIMIC NICU 1일 요약지·부모님 설명지 생성·검증·CDSS")
     sp = ap.add_subparsers(dest="cmd")
-    for name in ("list", "run", "batch", "perturb", "arms", "init-profile", "profile-check", "evaluate-note", "sample"):
+    for name in ("list", "run", "batch", "perturb", "arms", "init-profile", "profile-check", "evaluate-note", "sample", "train-risk"):
         s = sp.add_parser(name)
         s.add_argument("--data", required=(name != "init-profile"))
         s.add_argument("--profile", default=None, help="병원 프로파일 JSON(없으면 기본 양식)")
@@ -3986,6 +5594,7 @@ def kcd_main(argv=None):
         s.add_argument("--dur-csv", default=None, help="병용금기 CSV(성분A,성분B,사유)")
         s.add_argument("--no-write", action="store_true")
         s.add_argument("--stratify", action="store_true", help="sample: 생후일 구간별 균등 추출")
+        s.add_argument("--alert-top", type=float, default=0.10, help="train-risk: 학습 예측 상위 비율을 경보 기준으로(기본 0.10)")
         s.add_argument("--time-unit", default=None, help="시간 컬럼이 숫자(상대시간)일 때 단위 D/h/min")
     a = ap.parse_args(argv)
     if not a.cmd:
@@ -3995,7 +5604,8 @@ def kcd_main(argv=None):
         global TIME_UNIT
         TIME_UNIT = a.time_unit
     {"list": cmd_list, "run": cmd_run, "batch": cmd_batch, "perturb": cmd_perturb, "arms": cmd_arms, "init-profile": cmd_init_profile,
-     "profile-check": cmd_profile_check, "evaluate-note": cmd_evaluate_note, "sample": cmd_sample}[a.cmd](a)
+     "profile-check": cmd_profile_check, "evaluate-note": cmd_evaluate_note, "sample": cmd_sample,
+     "train-risk": cmd_train_risk}[a.cmd](a)
 
 
 if __name__ == "__main__" and not in_notebook_paste():
