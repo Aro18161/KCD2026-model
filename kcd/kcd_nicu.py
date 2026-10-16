@@ -1042,7 +1042,9 @@ def spec_to_profile(p, spec, path=None):
     p.setdefault("severity", {})["section"] = smap.get("severity", p["default_section"])
     p["_spec"] = {"path": path, "spec_id": spec.get("spec_id"), "version": spec.get("version"), "report_context": spec.get("report_context", {}),
                   "hard_constraints": spec.get("hard_constraints", []), "generation_instruction": spec.get("generation_instruction", ""),
-                  "required_information": items, "unmatched": unmatched}
+                  "required_information": items, "unmatched": unmatched,
+                  "llm_discretion": spec.get("llm_discretion", {}), "missing_data_policy": spec.get("missing_data_policy", {}),
+                  "implementation_notes": spec.get("implementation_notes", []), "prompt_notes": spec.get("prompt_notes")}
     return p
 
 
@@ -1050,8 +1052,40 @@ def spec_system_prompt():
     S = PROFILE.get("_spec") or {}
     req = "\n".join("- %s: %s" % (x.get("label"), x.get("requirement")) for x in S.get("required_information", []))
     hc = "\n".join("- %s" % x for x in S.get("hard_constraints", []))
-    return ("%s\n\n[필수정보]\n%s\n\n[반드시 지킬 규칙]\n%s\n- 주어진 facts만 사용하고, 문장마다 끝에 사용한 fact_id를 [F001] 형식으로 인용한다\n"
-            "- 출력은 '- '로 시작하는 문장 목록만 쓴다." % (S.get("generation_instruction", ""), req, hc))
+    D = S.get("llm_discretion") or {}
+    disc = []
+    if D.get("required_content"):
+        disc.append("- " + D["required_content"])
+    if D.get("additional_content"):
+        disc.append("- " + D["additional_content"])
+    if D.get("flexible"):
+        disc.append("- 자유롭게 정해도 되는 것: " + ", ".join(D["flexible"]))
+    mp = S.get("missing_data_policy") or {}
+    miss = "\n".join("- %s" % v for v in mp.values() if v)
+    # 구현 메모 중 생성 내용에 관한 것(원자료·기록·추정·가정)만 모델에 전달. 명세에 prompt_notes 가 있으면 그것을 씀
+    notes = S.get("prompt_notes") or [n for n in S.get("implementation_notes", []) if re.search(r"원자료|기록|추정|가정", n)]
+    out = "%s\n\n[필수정보 — 전체 8개 영역(참고용)]\n%s\n\n[반드시 지킬 규칙]\n%s" % (S.get("generation_instruction", ""), req, hc)
+    if disc:
+        out += "\n\n[선별·표현 재량]\n" + "\n".join(disc)
+    if miss:
+        out += "\n\n[결측 처리]\n" + miss
+    if notes:
+        out += "\n\n[주의]\n" + "\n".join("- %s" % n for n in notes)
+    out += ("\n\n[작성 방식]\n- 요청은 영역별로 나뉘어 온다. 각 요청에서는 '이번 요청 범위'에 지정된 영역만, 함께 준 facts만 사용해 쓴다\n"
+            "- 문장마다 끝에 사용한 fact_id를 [F001] 형식으로 인용한다\n- 출력은 '- '로 시작하는 문장 목록만 쓴다.")
+    return out
+
+
+def section_scope(doc, sec, title):
+    """사용자 메시지 앞머리: 이번 요청의 범위(한 영역)와 그 영역 요구사항."""
+    req = ""
+    if doc == "summary":
+        it = next((x for x in (PROFILE.get("_spec") or {}).get("required_information", []) if x.get("id") == sec), None)
+        if it and it.get("requirement"):
+            req = "\n이 영역 요구사항: %s" % it["requirement"]
+        return ("[이번 요청 범위] '%s' 영역만 작성한다. 아래 facts만 사용하고 다른 영역의 내용은 쓰지 않는다. "
+                "facts가 요구사항의 일부만 다루면 다룬 내용만 쓰고, 없는 요소를 추측해 채우지 않는다.%s\n" % (title, req))
+    return "[이번 요청 범위] 보호자 설명의 '%s' 묶음만 쓴다. 아래 facts만 사용하고 다른 묶음의 내용은 쓰지 않는다.\n" % title
 
 
 # --------------------------------------------------------------- 체크리스트 평가
@@ -2906,6 +2940,20 @@ class LLM(object):
     def chat(self, system, user, temperature=0.0, max_tokens=1500):
         import urllib.request
         max_tokens = int(os.environ.get("KCD_LLM_MAX_TOKENS", 0)) or max_tokens   # 추론(thinking) 모델은 크게(예: 8000)
+        # 응답 캐시: 같은 모델·프롬프트면 저장된 답을 재사용(중간 실패 후 다시 돌릴 때 이미 받은 답을 버리지 않도록).
+        # 위치 KCD_LLM_CACHE(기본 ./llm_cache), off 면 사용 안 함. 프롬프트에 환자 정보가 있으므로 분석환경 밖 반출 금지
+        cdir = os.environ.get("KCD_LLM_CACHE", "llm_cache")
+        ckey = hashlib.sha256(json.dumps([self.base, self.model, system, user, temperature, max_tokens], ensure_ascii=False).encode("utf-8")).hexdigest()
+        cpath = os.path.join(cdir, self.model.replace("/", "_"), ckey[:2], ckey + ".json") if cdir != "off" else None
+        if cpath and os.path.exists(cpath):
+            try:
+                with open(cpath, encoding="utf-8") as fh:
+                    txt = json.load(fh)["text"]
+                self.hits = getattr(self, "hits", 0) + 1
+                sys.stderr.write("[llm] 캐시 사용 %d(%s)\n" % (self.hits, self.model))
+                return txt
+            except Exception:
+                pass
         body = json.dumps({"model": self.model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                            "temperature": temperature, "max_tokens": max_tokens}).encode("utf-8")
         req = urllib.request.Request(self.base.rstrip("/") + "/chat/completions", data=body,
@@ -2927,6 +2975,14 @@ class LLM(object):
         # 추론 모델의 <think>…</think> 는 버림(안의 '- ' 줄이 인계 문장으로 섞이지 않도록). 닫는 태그가 없으면(잘림) 빈 응답 취급
         if "<think>" in txt or "</think>" in txt:
             txt = txt.split("</think>", 1)[1] if "</think>" in txt else ""
+        if cpath and txt.strip():   # 빈 답(토큰 한도 소진 등)은 저장하지 않아 다음 실행에서 다시 시도
+            try:
+                os.makedirs(os.path.dirname(cpath), exist_ok=True)
+                with open(cpath + ".tmp", "w", encoding="utf-8") as fh:
+                    json.dump({"model": self.model, "text": txt.strip(), "secs": round(time.time() - t1, 1), "tokens": u.get("total_tokens")}, fh, ensure_ascii=False)
+                os.replace(cpath + ".tmp", cpath)
+            except Exception:
+                pass
         return txt.strip()
 
 
@@ -2979,21 +3035,38 @@ def render_llm(ctx, facts, alerts, llm, audit, repair=True, max_rounds=2, doc="s
     secmap = SECTIONS if doc == "summary" else PARENT_SECTIONS
     sysp = (spec_system_prompt() if PROFILE.get("_spec") else SYS_GROUNDED) if doc == "summary" else SYS_PARENT
     sents = []
+    gen = {"gen_llm_calls": 0, "gen_llm_errors": 0, "gen_parse_fail": 0, "gen_fallback_sections": 0, "gen_fallback_sents": 0, "gen_llm_sents": 0}
     for s, fs in plan.items():
         if not fs:
-            sents.append({"section": s, "text": "해당 사항 없음." if doc == "summary" else PROFILE["documents"]["parent"].get("empty_text"), "cites": [], "fixed": doc != "summary"})
+            empty = "해당 사항 없음." if doc == "summary" else PROFILE["documents"]["parent"].get("empty_text")
+            if empty:   # 보호자 브리핑은 내용 없는 묶음을 빼는 것이 기본(템플릿과 같게)
+                sents.append({"section": s, "text": empty, "cites": [], "fixed": doc != "summary"})
             continue
-        user = "섹션: %s\nfacts:\n%s" % (secmap[s], "\n".join("%s: %s" % (f.fid, f.text) for f in fs))
+        user = section_scope(doc, s, secmap[s]) + "facts:\n%s" % "\n".join("%s: %s" % (f.fid, f.text) for f in fs)
         t1 = time.time()
+        err = None
+        gen["gen_llm_calls"] += 1
         try:
             out = llm.chat(sysp, user)
         except Exception as e:
-            out = ""
-            audit.log("llm_error", {"section": s}, {"error": repr(e)})
+            out, err = "", repr(e)
+            gen["gen_llm_errors"] += 1
+            audit.log("llm_error", {"section": s}, {"error": err})
         audit.log("llm_render_" + doc, {"section": s, "facts": [f.fid for f in fs]}, {"n_chars": len(out)}, time.time() - t1, llm.model)
-        bl = parse_bullets(out) or [("%s [%s]" % (f.text, f.fid)) for f in fs]
-        for b in bl:
-            sents.append({"section": s, "text": b, "cites": cites_of(b)})
+        bl = parse_bullets(out)
+        if bl:
+            gen["gen_llm_sents"] += len(bl)
+            for b in bl:
+                sents.append({"section": s, "text": b, "cites": cites_of(b)})
+        else:   # 호출 실패·목록 형식 아님 → 근거 원문으로 대체하되 표시해 비교에서 구분
+            reason = ("LLM 호출 실패: %s" % err[:80]) if err else ("LLM 응답에서 문장 목록을 찾지 못함(%d자)" % len(out))
+            if not err:
+                gen["gen_parse_fail"] += 1
+            gen["gen_fallback_sections"] += 1
+            gen["gen_fallback_sents"] += len(fs)
+            audit.log("llm_fallback_" + doc, {"section": s}, {"reason": reason})
+            for f in fs:
+                sents.append({"section": s, "text": "%s [%s]" % (f.text, f.fid), "cites": [f.fid], "fallback": reason})
     if doc == "summary":
         sents += [_alert_sent(a, CDSS_SEC()) for a in alerts]
     else:
@@ -3001,7 +3074,7 @@ def render_llm(ctx, facts, alerts, llm, audit, repair=True, max_rounds=2, doc="s
         sents += [x for x in tmpl if x["section"] in (PCDSS_SEC(), PROFILE["documents"]["parent"].get("closing_section", "P8"))]
     for i, x in enumerate(sents, 1):
         x["sid"] = "S%03d" % i
-    stats = {"repaired": 0, "replaced": 0, "appended": 0}
+    stats = dict(gen, repaired=0, replaced=0, appended=0)
     if not repair:
         return sents, stats
     V = Verifier(ctx, facts, alerts=alerts, doc=doc)
@@ -3015,12 +3088,15 @@ def render_llm(ctx, facts, alerts, llm, audit, repair=True, max_rounds=2, doc="s
             ev = [F[c] for c in x["cites"] if c in F] or plan.get(x["section"], [])
             user = "다음 문장이 근거 facts와 일치하지 않는다(사유: %s). facts만 사용해 한 문장으로 다시 쓰고 인용을 붙여라.\n문장: %s\nfacts:\n%s" % (
                 v["reason"], x["text"], "\n".join("%s: %s" % (f.fid, f.text) for f in ev))
+            stats["gen_llm_calls"] += 1
             try:
                 b = parse_bullets(llm.chat(sysp, user))
                 if b:
                     x["text"], x["cites"] = b[0], cites_of(b[0])
+                    x.pop("fallback", None)
                     stats["repaired"] += 1
             except Exception as e:
+                stats["gen_llm_errors"] += 1
                 audit.log("llm_error", {"sid": x["sid"]}, {"error": repr(e)})
     for x in sents:
         if x["section"] in skip or x.get("fixed"):
@@ -3034,6 +3110,7 @@ def render_llm(ctx, facts, alerts, llm, audit, repair=True, max_rounds=2, doc="s
                 x["cites"] = [f.fid for f in ev]
             else:
                 x["text"], x["cites"] = "(삭제됨: 근거 없는 문장)", []
+            x["fallback"] = "검증 실패 문장을 근거 원문으로 교체"
             stats["replaced"] += 1
     only = required_fids(ctx, doc)
     cov = V.coverage(sents, only=only)
@@ -3043,7 +3120,7 @@ def render_llm(ctx, facts, alerts, llm, audit, repair=True, max_rounds=2, doc="s
             sec = f.section if (doc == "summary" or f.ftype == "parent_gap") else PROFILE["documents"]["parent"].get("section_of", {}).get(f.ftype, f.section)
             txt = f.text if doc == "summary" else (lay_sentence(ctx, f) or f.text)
             idx = max([i for i, x in enumerate(sents) if x["section"] == sec] or [len(sents) - 1])
-            sents.insert(idx + 1, {"section": sec, "text": "%s [%s]" % (txt, f.fid), "cites": [f.fid]})
+            sents.insert(idx + 1, {"section": sec, "text": "%s [%s]" % (txt, f.fid), "cites": [f.fid], "fallback": "누락된 필수 정보를 근거 원문으로 추가"})
             stats["appended"] += 1
     for i, x in enumerate(sents, 1):
         x["sid"] = "S%03d" % i
@@ -4095,6 +4172,10 @@ def report_markdown(ctx, res, series):
                   ("checklist_gap", "확인 필요로 표시"), ("checklist_required_missing_in_note", "문서에서 빠진 필수 요소")):
         L.append("| %s | %s | %s |" % (nm, sm.get(k, "-"), pm.get(k, "-")))
     L.append("| 부모님 요약지 문장 평균 길이(자) | - | %s |" % pm.get("read_avg_chars", "-"))
+    for k, nm in (("gen_llm_calls", "LLM 호출"), ("gen_llm_errors", "LLM 호출 오류"), ("gen_parse_fail", "응답 형식 오류"),
+                  ("gen_fallback_sections", "원문 대체된 섹션"), ("fallback_sents_total", "원문 대체·추가 문장(전체)"),
+                  ("gen_sents", "생성 문장(대체·고정 제외)"), ("gen_supported", "생성 문장 중 근거 일치"), ("judge_model", "LLM 판정자")):
+        L.append("| %s | %s | %s |" % (nm, sm.get(k, "-"), pm.get(k, "-")))
     bad = [(x, vd[x["sid"]]) for x in s["sents"] if vd.get(x["sid"], {}).get("label") not in (None, "Supported")]
     qvd = {v["sid"]: v for v in q["verdicts"]}
     bad += [(x, qvd[x["sid"]]) for x in q["sents"] if qvd.get(x["sid"], {}).get("label") not in (None, "Supported")]
@@ -4451,6 +4532,8 @@ def sentence_html(ctx, x, v, F, sid_anchor=True):
             pop += "<div class='muted'>파생 fact: 입력 %s</div>" % _esc(der[0]["derived_from"])
     badge = "<span class='tip badge %s' tabindex='0'>%s<span class='pop wide'>%s</span></span>" % (cls, "✔" if cls == "ok" else ("•" if cls == "fix" else "⚠"), pop)
     anchor = " id='%s'" % x["sid"] if sid_anchor else ""
+    if x.get("fallback"):
+        badge += " <span class='tip badge warn' tabindex='0'>원문 대체<span class='pop'>LLM이 쓴 문장이 아니라 근거 원문입니다. 사유: %s</span></span>" % _esc(x["fallback"])
     return "<li%s>%s %s</li>" % (anchor, "".join(parts), badge)
 
 
@@ -4847,7 +4930,14 @@ class Pipeline(object):
         risk_alerts(ctx, facts, alerts, ctx.birth)
         finalize_facts(ctx, facts, alerts)
         audit.log("cdss", {"facts": [f.fid for f in facts]}, {"alerts": [a["rule_id"] for a in alerts]})
-        judge = llm if (llm is not None and llm.ok) else None
+        # 판정자 고정: 생성 모델이 스스로 채점하지 않도록 KCD_JUDGE_MODEL 로 지정한 한 모델만 사용. 없으면 규칙 검증만
+        jm = os.environ.get("KCD_JUDGE_MODEL", "").strip()
+        judge = None
+        if jm:
+            judge = LLM()
+            judge.model = jm
+            judge.ok = bool(judge.base and jm)
+            judge = judge if judge.ok else None
         res = {"ctx": ctx, "facts": facts, "alerts": alerts, "ssot_id": ssot_id(ctx, facts)}
         try:
             res["raw_usage"] = raw_usage(ctx, facts)
@@ -4864,7 +4954,14 @@ class Pipeline(object):
             m = metrics(vd, cov, alerts if doc == "summary" else None, chk)
             if doc == "parent":
                 m.update(readability(sents))
-            m.update({"repair_" + k: v for k, v in stats.items()})
+            m.update({(k if k.startswith("gen_") else "repair_" + k): v for k, v in stats.items()})
+            # 생성 문장(고정 문구·CDSS·원문 대체 제외)만의 근거 일치 → 모델 품질 비교용
+            vmap = {v["sid"]: v for v in vd}
+            gs = [x for x in sents if not x.get("fixed") and not x.get("fallback") and x["section"] not in (CDSS_SEC(), PCDSS_SEC())]
+            m["gen_sents"] = len(gs)
+            m["gen_supported"] = sum(1 for x in gs if vmap.get(x["sid"], {}).get("label") == "Supported")
+            m["fallback_sents_total"] = sum(1 for x in sents if x.get("fallback"))
+            m["judge_model"] = jm or "없음(규칙 검증만)"
             audit.log("verify_" + doc, {"n_sent": len(sents)}, m)
             res[doc] = {"sents": sents, "verdicts": vd, "coverage": cov, "checklist": chk, "metrics": m}
             pre = "" if doc == "summary" else "parent_"
