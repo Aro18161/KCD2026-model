@@ -17,7 +17,7 @@ kcd_nicu.py — K-MIMIC 형식 데이터로 NICU 1일 요약지(의료진용)와
   python kcd_nicu.py init-profile  --out my_hospital.json              # 병원 프로파일 초안
   python kcd_nicu.py profile-check --data DIR --profile my_hospital.json   # 항목별 데이터 자동 채움 비율
   python kcd_nicu.py evaluate-note --data DIR --stay 123 --day 2 --note note.txt --doc summary|parent
-  python kcd_nicu.py sample        --data DIR --n 100 --seed 0 --out sample [--stratify]   # 생후 28일 이하 평가 시점 무작위 추출
+  python kcd_nicu.py sample        --data "DIR/*" --n 30 --seed 0 --out sample [--stratify]   # 생후 28일 이하 평가 시점 무작위 추출(여러 폴더 가능)
 
 공통 옵션: --profile 병원.json, --cohort nicu|all(all = 전체 ICU, 코드 점검용), --time-unit D|h|min
 Jupyter 셀에 통째로 붙여넣은 경우: kcd_main("run --data datasets/kmimic-emr-001/268 --stay auto --out out")
@@ -3461,7 +3461,8 @@ def cmd_evaluate_note(a):
 SAMPLING_DEFAULT = {
     "max_age_days": 28,                 # 평가 시점 생후 일수 상한(출생일 = 0일)
     "birth_columns": ["dob", "birth_datetime", "birthdate", "birth_time", "date_of_birth"],
-    "birth_proxy_max_hours": 48,        # 생년월일 컬럼이 없으면: 나이 0세이고 입원→NICU 입실 48시간 이내일 때만 입원 시각을 출생 시각으로 근사
+    "birth_proxy_max_hours": 48,        # 생년월일 컬럼이 없으면: 신생아(나이 0세, 또는 NICU 병동이면서 나이 결측)이고 입원→NICU 입실 48시간 이내일 때만 입원 시각을 출생 시각으로 근사
+    "missing_age_as_neonate": True,     # K-MIMIC은 NICU 환아의 anchor_age 를 비워 둠 → NICU 병동 + 나이 결측이면 신생아로 간주
     "min_icu_hours_before": 24,         # 평가 시점 직전 24시간 전체가 같은 NICU 재실 기간 안
     "min_hr": 6, "min_spo2": 6, "min_temp": 2, "min_bp": 1,   # 직전 24시간 기록 건수 하한(호흡·순환·체온 항목)
     "weight_within_days": 7,            # 평가 시점 이전 7일 안에 체중 기록(현재 체중·mL/kg 계산)
@@ -3523,21 +3524,38 @@ def birth_times(p, S):
             continue
         age = to_num(pd.Series([r.get("anchor_age")])).iloc[0]
         a = amap.get(r["hadm_id"])
-        if pd.notna(age) and age < 1 and a is not None and pd.notna(a) and \
+        neo = (pd.notna(age) and age < 1) or (pd.isna(age) and S.get("missing_age_as_neonate", True) and bool(r.get("_unit_match", False)))
+        if neo and a is not None and pd.notna(a) and \
                 0 <= (pd.Timestamp(r["intime_dt"]) - pd.Timestamp(a)).total_seconds() <= S["birth_proxy_max_hours"] * 3600:
-            out[r["stay_id"]] = (pd.Timestamp(a), "입원 시각 근사")
+            out[r["stay_id"]] = (pd.Timestamp(a), "입원 시각 근사" + ("(나이 결측 NICU)" if pd.isna(age) else ""))
         else:
             out[r["stay_id"]] = (None, "출생 시각 확인 불가")
     return out
 
 
-def cmd_sample(a):
+def expand_dirs(spec):
+    """--data 값을 폴더 목록으로. 쉼표 구분과 와일드카드(*) 허용. ICUSTAYS 가 있는 폴더만."""
+    import glob as _g
+    out = []
+    for part in str(spec).split(","):
+        part = os.path.expanduser(part.strip())
+        cands = sorted(_g.glob(part)) if any(ch in part for ch in "*?[") else [part]
+        for d in cands:
+            if os.path.isdir(d) and any(os.path.exists(os.path.join(d, f)) for f in ("ICUSTAYS.csv", "icustays.csv", "ICUSTAYS.csv.gz", "ICUSTAYS.parquet")):
+                out.append(d)
+            elif os.path.isdir(d):
+                out += sorted(x for x in _g.glob(os.path.join(d, "*")) if os.path.exists(os.path.join(x, "ICUSTAYS.csv")))
+    return list(OrderedDict.fromkeys(out))
+
+
+def _sample_one_dir(a, data_dir):
+    """한 데이터 폴더에서 적격 평가 시점과 단계별 흐름 계산. 반환: (rows, steps, flow)"""
     S = dict(SAMPLING_DEFAULT)
-    p = mk(a)
+    p = Pipeline(data_dir, a.dur_csv, verbose=False, profile=a.profile, cohort=a.cohort)
     S.update(PROFILE.get("sampling", {}))
     C = p.cands.copy()
     hadms = C["hadm_id"].tolist()
-    print("[sample] 코호트 %d stay의 이벤트를 읽는 중..." % len(C))
+    print("[sample] %s: 코호트 %d stay" % (os.path.basename(os.path.normpath(data_dir)), len(C)))
     chart = p.kd.get("CHARTEVENTS", hadms)
     if not chart.empty:
         chart = chart.assign(concept=chart["itemid"].map(lambda i: p.item_map.get(i, (None,))[0]))
@@ -3591,13 +3609,45 @@ def cmd_sample(a):
                     flow[i][0] += 1
                     flow[i][1].add(person)
             if all(ok):
-                rows.append({"person_id": person, "index_date": t0.strftime("%Y-%m-%d"), "index_datetime": str(t0), "stay_id": sid, "hadm_id": h,
+                rows.append({"person_id": person, "index_date": t0.strftime("%Y-%m-%d"), "index_datetime": str(t0), "data_dir": data_dir, "stay_id": sid, "hadm_id": h,
                              "kcd_day": k, "age_days": age_days, "birth_source": bsrc, "icu_day": (t0.normalize() - intime.normalize()).days + 1,
                              "n_hr_24h": n["hr"], "n_spo2_24h": n["spo2"], "n_temp_24h": n["temp"], "n_bp_24h": n["bp"], "n_resp_24h": n["resp"],
                              "n_intake_24h": n["intake"], "n_urine_24h": n["urine"], "n_lab_24h": n["lab"], "n_emar_24h": n["emar"], "weight_days_ago": wdays})
+    return rows, steps, flow
+
+
+def cmd_sample(a):
+    dirs = expand_dirs(a.data)
+    if not dirs:
+        raise SystemExit("데이터 폴더를 찾지 못했습니다: %s" % a.data)
+    print("[sample] 데이터 폴더 %d개" % len(dirs))
+    rows, steps, flow, skipped = [], None, None, []
+    for d in dirs:
+        try:
+            r, st, fl_ = _sample_one_dir(a, d)
+        except SystemExit as e:
+            skipped.append((d, str(e)[:80]))
+            continue
+        rows += r
+        if flow is None:
+            steps, flow = st, fl_
+        else:
+            for i, f in enumerate(fl_):
+                flow[i][0] += f[0]
+                flow[i][1] |= f[1]
+    if flow is None:
+        raise SystemExit("모든 폴더에서 NICU 코호트가 0건입니다: %s" % skipped[:3])
+    S = dict(SAMPLING_DEFAULT)
+    S.update(PROFILE.get("sampling", {}))
     elig = pd.DataFrame(rows)
     os.makedirs(a.out, exist_ok=True)
     fl = pd.DataFrame([{"step": s, "candidate_days": f[0], "persons": len(f[1])} for s, f in zip(steps, flow)])
+    if skipped:
+        print("[sample] 코호트 0건으로 건너뛴 폴더 %d개" % len(skipped))
+    if not elig.empty:
+        dup = elig.groupby("person_id")["data_dir"].nunique()
+        if (dup > 1).any():
+            print("[sample] 주의: 여러 폴더에 걸친 person_id %d명(한 환아당 1시점 규칙은 person_id 기준으로 적용)" % int((dup > 1).sum()))
     fl.to_csv(os.path.join(a.out, "sample_flow.csv"), index=False)
     print("\n[선정 흐름]\n" + fl.to_string(index=False))
     if elig.empty:
@@ -3625,7 +3675,7 @@ def cmd_sample(a):
     with open(os.path.join(a.out, "nicu_sample_commands.sh"), "w", encoding="utf-8") as f:
         f.write("# 표본별 1일 요약지·부모님 설명지 생성 명령\n")
         for _, x in smp.iterrows():
-            f.write("python kcd_nicu.py run --data %s --stay %s --day %d --out %s%s\n" % (a.data, x["stay_id"], x["kcd_day"], os.path.join(a.out, "generated"),
+            f.write("python kcd_nicu.py run --data %s --stay %s --day %d --out %s%s\n" % (x["data_dir"], x["stay_id"], x["kcd_day"], os.path.join(a.out, "generated"),
                                                                                    (" --profile %s" % a.profile) if a.profile else ""))
     print("\n[표본] 적격 환아 %d명 중 %d명 추출 (seed=%d%s)" % (len(elig), len(smp), a.seed, ", 생후일 층화" if a.stratify else ""))
     print(smp["dol_stratum"].value_counts().sort_index().to_string())

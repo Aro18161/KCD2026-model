@@ -2,3 +2,7 @@ data/
 out/
 *.env
 .venv/
+offline_wheels_py312/
+offline_wheels_py312.zip
+upload_khdp/
+upload_khdp.zip
