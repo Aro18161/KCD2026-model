@@ -3570,7 +3570,7 @@ UNIT_CONV = {("cr", "umol/l", "mg/dl"): 1 / 88.4, ("tbil", "umol/l", "mg/dl"): 1
 
 def _unorm(u):
     u = str(u or "").strip().lower().replace("µ", "u").replace("μ", "u").replace("㎕", "ul").replace("㎗", "dl").replace("³", "^3").replace(" ", "")
-    u = u.replace("×", "x").replace("meq/l", "mmol/l")
+    u = u.replace("×", "x").replace("meq/l", "mmol/l").replace("micromol/", "umol/").replace("/litre", "/l")
     if re.fullmatch(r"x?10\^?9/l|x?10\^?3/ul|k/ul|x?10\^?3/mm\^?3|10\*3/ul", u):
         return "10^3/ul"
     return u
@@ -3724,7 +3724,18 @@ def lit_cite(e):
 def lit_cond(e):
     g = (e.get("ga_min_wk"), e.get("ga_max_wk"))
     p = (e.get("pna_min_h"), e.get("pna_max_h"))
-    gs = "재태 전체" if g == (None, None) else "재태 %s~%s주" % (fmt_num(g[0]) if g[0] is not None else "", fmt_num(g[1]) if g[1] is not None else "")
+    if g == (None, None):
+        gs = "재태 전체"
+    elif g[0] is not None and g[0] == g[1]:
+        gs = "재태 %s주" % fmt_num(g[0])
+    elif g[1] is None:
+        gs = "재태 %s주 이상" % fmt_num(g[0])
+    elif g[0] is None:
+        gs = "재태 %s주 이하" % fmt_num(g[1])
+    else:
+        gs = "재태 %s~%s주" % (fmt_num(g[0]), fmt_num(g[1]))
+    if e.get("ga_basis") == "pma":
+        gs = gs.replace("재태", "교정연령")
     if p[1] is None and (p[0] is None or p[0] == 0):
         ps = "생후 전체"
     elif p[1] is None:
@@ -3745,7 +3756,7 @@ def apply_lit(ctx, x):
     for i, t in enumerate(x["t"]):
         pna = (pd.Timestamp(t) - b).total_seconds() / 3600.0 if b is not None else None
         ms = lit_match(x["key"], ga, pna, x["unit"])
-        band = next(((lo, hi, e) for e, fit, lo, hi in ms if e.get("kind", "reference_interval") in REF_BAND_KINDS and fit in ("ok", "any")), None)
+        band = next(((lo, hi, e) for e, fit, lo, hi in ms if e.get("kind", "reference_interval") in REF_BAND_KINDS and fit in ("ok", "any") and e.get("chart", True)), None)
         x["lit"].append(band)
         x["lines"].append([(lo, hi, e) for e, fit, lo, hi in ms if e.get("kind") in REF_LINE_KINDS and fit in ("ok", "any") and e.get("chart", True)])
         if i == len(x["t"]) - 1:
@@ -3770,32 +3781,61 @@ def lit_judge(v, lo, hi):
     return "안"
 
 
+def lit_label(e):
+    return e.get("label_ko") or e.get("high_label") or e.get("low_label") or "기준"
+
+
+def _lit_judge_one(e, v, lo, hi):
+    below = e.get("act_when") == "below"
+    one = hi if lo is None else (lo if hi is None else None)
+    if e.get("kind") in REF_LINE_KINDS and one is not None:
+        if below:
+            return "기준 미만(해당)" if v < one else "기준 이상"
+        return "기준 초과(해당)" if v > one else "기준 이하"
+    if e.get("kind") in REF_LINE_KINDS:
+        return {"아래": "기준 구간 아래", "위": "기준 구간 위", "안": "기준 구간 안"}[lit_judge(v, lo, hi)]
+    return {"아래": "범위 아래", "위": "범위 위", "안": "범위 안"}[lit_judge(v, lo, hi)]
+
+
 def lit_rows(x):
-    """최근 값과 모든 문헌 기준 비교 행: [(문헌, 종류, 조건, 기준, 판정, GA 적합)]"""
+    """최근 값과 문헌 기준 비교 행: [(entry, 종류, 조건, 기준, 판정)].
+    재태주수를 몰라 주수별 행이 여러 개 맞으면 같은 문헌·같은 기준끼리 한 줄로 묶어 범위로 보여 줌."""
     v = x["v"][-1]
-    rows = []
+    groups = OrderedDict()
     for m in x.get("lit_last", []):
         e = m["e"]
-        rng = rng_txt(m["lo"], m["hi"])
-        lab = "%s–%s" % (e.get("low_label") or "", e.get("high_label") or "")
-        kind = {"reference_interval": "참고범위", "prediction_limit": "예측한계", "treatment_threshold": "치료 기준선", "target_range": "목표범위",
-                "lower_limit": "하한"}.get(e.get("kind"), e.get("kind", ""))
-        below = e.get("act_when") == "below"
-        one = m["hi"] if m["lo"] is None else (m["lo"] if m["hi"] is None else None)
-        if e.get("kind") in REF_LINE_KINDS and one is not None:
-            if below:
-                jd = "기준 미만(해당)" if v < one else "기준 이상"
-            else:
-                jd = "기준 초과(해당)" if v > one else "기준 이하"
-        elif e.get("kind") in REF_LINE_KINDS:
-            jd = {"아래": "기준 구간 아래", "위": "기준 구간 위", "안": "기준 구간 안"}[lit_judge(v, m["lo"], m["hi"])]
+        key = (e["source"].get("short") if isinstance(e.get("source"), dict) else e.get("source"), e.get("kind"), lit_label(e), e.get("risk_ko") or e.get("risk_group"),
+               m["fit"] == "unknown", e.get("pna_min_h") if m["fit"] != "unknown" else None)
+        groups.setdefault(key, []).append(m)
+    KIND = {"reference_interval": "참고범위", "prediction_limit": "예측한계", "treatment_threshold": "치료 기준", "target_range": "목표", "lower_limit": "하한"}
+    rows = []
+    for key, ms in groups.items():
+        e = ms[0]["e"]
+        kind = KIND.get(e.get("kind"), e.get("kind", ""))
+        if key[3]:
+            kind += " · " + key[3]
+        jds = [_lit_judge_one(m["e"], v, m["lo"], m["hi"]) for m in ms]
+        if len(ms) == 1:
+            m = ms[0]
+            cond, rng = lit_cond(e), rng_txt(m["lo"], m["hi"])
+            jd = jds[0]
         else:
-            jd = {"아래": "범위 아래", "위": "범위 위", "안": "범위 안"}[lit_judge(v, m["lo"], m["hi"])]
-        if m["fit"] == "unknown":
-            jd += "(재태주수 확인 필요)"
-        if e.get("risk_group"):
-            kind += " · " + e["risk_group"]
-        rows.append((e, kind, lit_cond(e), "%s %s (%s)" % (rng, x["unit"], lab.strip("–")), jd))
+            gl = [m["e"].get("ga_min_wk") for m in ms if m["e"].get("ga_min_wk") is not None]
+            gh = [m["e"].get("ga_max_wk") for m in ms]
+            ga_txt = "재태 %s~%s주(주수별 %d개)" % (fmt_num(min(gl)) if gl else "", "" if None in gh else fmt_num(max(gh)), len(ms))
+            cond = ga_txt + " · " + lit_cond(e).split(" · ", 1)[1]
+
+            def wk(m):
+                a, b = m["e"].get("ga_min_wk"), m["e"].get("ga_max_wk")
+                return ("%s주" % fmt_num(a)) if (a is not None and a == b) else ("%s주+" % fmt_num(a) if b is None else "%s~%s주" % (fmt_num(a) if a is not None else "", fmt_num(b)))
+            ms = sorted(ms, key=lambda m: (m["e"].get("ga_min_wk") or 0))
+            rng = " / ".join("%s %s" % (wk(m), rng_txt(m["lo"], m["hi"]).replace("상한 ", "").replace("하한 ", "≥")) for m in ms)
+            if e.get("ga_basis") == "pma":
+                cond = cond.replace("재태", "교정연령")
+            jd = jds[0] if len(set(jds)) == 1 else "재태주수에 따라 다름(%s)" % ", ".join(sorted(set(jds)))
+        if any(m["fit"] == "unknown" for m in ms):
+            jd += " · 재태주수 확인 필요"
+        rows.append((e, kind, cond, "%s %s (%s)" % (rng, x["unit"], lit_label(e)), jd))
     return rows
 
 
@@ -3945,7 +3985,7 @@ def trend_svg(x, w=560, h=150):
             for r in (a, b):
                 if r is not None:
                     parts.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="#c62828" stroke-width="1.4" stroke-dasharray="4 3"><title>%s %s (%s)</title></line>' % (
-                        xa, Y(r), xb, Y(r), _esc(e.get("high_label") or e.get("low_label") or "기준선"), fmt_num(round(r, 2)), _esc(lit_cite(e))))
+                        xa, Y(r), xb, Y(r), _esc(lit_label(e)), fmt_num(round(r, 2)), _esc(lit_cite(e))))
     parts.append('<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="#999" stroke-width="1"/>' % (L, h - B, w - R, h - B))
     pts = " ".join("%.1f,%.1f" % (X(a), Y(b)) for a, b in zip(t, v))
     parts.append('<polyline points="%s" fill="none" stroke="#1565c0" stroke-width="1.8"/>' % pts)
@@ -3973,7 +4013,7 @@ def ref_caption(x):
         for b in lit:
             if b[2] not in es:
                 es.append(b[2])
-        s = "초록 띠: " + "; ".join("%s (%s–%s, %s)" % (lit_cite(e), e.get("low_label") or "", e.get("high_label") or "", lit_cond(e)) for e in es)
+        s = "초록 띠: " + "; ".join("%s (%s, %s)" % (lit_cite(e), lit_label(e), lit_cond(e)) for e in es[:3]) + (" 외 %d개 구간" % (len(es) - 3) if len(es) > 3 else "")
     elif x.get("ref") and any(r is not None for r in x["ref"]):
         s = "초록 띠: 프로파일 고정 범위(문헌·재태주수·생후시간 미반영)"
         if REF_LIT["entries"]:
@@ -3987,7 +4027,12 @@ def ref_caption(x):
             if e not in ln:
                 ln.append(e)
     if ln:
-        s += " · 빨간 점선: " + "; ".join("%s %s (%s)" % (e.get("high_label") or e.get("low_label") or "기준선", lit_cite(e), lit_cond(e)) for e in ln)
+        names = []
+        for e in ln:
+            nm = "%s %s%s" % (lit_label(e), lit_cite(e), (" · " + e["risk_ko"]) if e.get("risk_ko") else "")
+            if nm not in names:
+                names.append(nm)
+        s += " · 빨간 점선: " + "; ".join(names) + " (생후시간에 따라 값이 바뀜)"
     if REF_LIT["entries"]:
         s += " · 재태주수: %s · 생후시간: %s" % ((fmt_num(round(ga["wk"], 1)) + "주") if ga.get("wk") else ga.get("src", "확인 불가"), x.get("birth_src") or "확인 불가")
     return s
@@ -4347,6 +4392,7 @@ table.raw{font-size:11px;margin:4px 0}table.raw td,table.raw th{padding:2px 4px}
 def lit_src_pop(e):
     s = e.get("source", {})
     rows = [("인용", s.get("citation")), ("위치", s.get("location")), ("대상", e.get("population")), ("n", e.get("n")),
+            ("원문 기준명", " / ".join(z for z in (e.get("low_label"), e.get("high_label")) if z)), ("위험군(원문)", e.get("risk_group")), ("비고", e.get("note")),
             ("원문", e.get("quote")), ("원 단위", e.get("unit")), ("DOI", s.get("doi")), ("PMID", s.get("pmid"))]
     body = "".join("<div><b>%s</b> %s</div>" % (k, _esc(v)) for k, v in rows if v not in (None, ""))
     if s.get("url"):
