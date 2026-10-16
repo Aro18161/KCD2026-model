@@ -17,6 +17,7 @@ kcd_nicu.py — K-MIMIC 형식 데이터로 NICU 1일 요약지(의료진용)와
   python kcd_nicu.py init-profile  --out my_hospital.json              # 병원 프로파일 초안
   python kcd_nicu.py profile-check --data DIR --profile my_hospital.json   # 항목별 데이터 자동 채움 비율
   python kcd_nicu.py evaluate-note --data DIR --stay 123 --day 2 --note note.txt --doc summary|parent
+  python kcd_nicu.py sample        --data DIR --n 100 --seed 0 --out sample [--stratify]   # 생후 28일 이하 평가 시점 무작위 추출
 
 공통 옵션: --profile 병원.json, --cohort nicu|all(all = 전체 ICU, 코드 점검용), --time-unit D|h|min
 Jupyter 셀에 통째로 붙여넣은 경우: kcd_main("run --data datasets/kmimic-emr-001/268 --stay auto --out out")
@@ -535,53 +536,100 @@ DEFAULT_PROFILE = {
                          {"id": "D7", "title": "7. 투약"}, {"id": "D8", "title": "8. 주의사항 (CDSS 규칙 기반)"}],
             "cdss_section": "D8",
             "section_cap": {"D1": 8, "D2": 4, "D3": 16, "D4": 6, "D5": 8, "D6": 16, "D7": 16},
+            # NICU 간호 daily 인계 필수 항목(nicu_handoff_required_items_v2.md) 17개 영역 기준.
+            # area = 영역 번호, required = Core, required_if = 해당 환아에게만 필수(preterm / invasive_vent / tube_feeding),
+            # 조건부 영역(14~17)은 required=False: 기록이 있을 때만 포함. after_cdss = CDSS 이후 판정(중증도).
             "checklist": [
-                _ck("patient_info", "성별·입원일수·NICU 재실일수", "D1", True, [_f("patient_info")]),
-                _ck("weight", "체중(현재·전일·입실 시 대비)", "D1", True, [_f("weight")]),
-                _ck("gestational_age", "재태주수·교정주수", "D1", True, [{"type": "chart_regex", "regex": "재태|gestational|\\bGA\\b|주수|교정"}, {"type": "manual"}],
-                    mention_regex="재태|주수|\\bGA\\b|교정"),
-                _ck("birth_weight", "출생체중", "D1", True, [{"type": "chart_regex", "regex": "출생 ?체중|birth ?weight"}, {"type": "manual"}],
-                    mention_regex="출생 ?체중|birth ?weight"),
-                _ck("service", "담당 진료과", "D1", False, [{"type": "service"}]),
-                _ck("isolation", "격리·다제내성균", "D1", True,
-                    [{"type": "micro_org_regex", "regex": "MRSA|VRE|CRE|CRAB|CRPA|carbapenem|methicillin.resistant|vancomycin.resistant"},
-                     {"type": "chart_regex", "regex": "격리|isolation"}, {"type": "manual"}], mention_regex="격리|isolation|MRSA|VRE|CRE|다제내성"),
-                _ck("dx_main", "주진단", "D2", True, [_f("diagnosis_main")]),
-                _ck("dx_other", "기타 진단", "D2", False, [_f("diagnosis_other")]),
-                _ck("prematurity", "미숙아·저체중 관련 진단", "D2", False, [_f("prematurity")]),
-                _ck("vitals", "활력징후 범위", "D3", True, [_f("vitals_24h")]),
-                _ck("events", "무호흡·서맥·산소포화도 저하", "D3", True, [_f("neo_events")], mention_regex="무호흡|서맥|산소포화도 저하|apnea|brady|desat"),
-                _ck("respiration", "호흡 보조", "D3", True, [_f("resp_support")]),
-                _ck("resp_change", "호흡 보조 변경", "D3", False, [_f("resp_change")]),
-                _ck("lines", "정맥관·카테터(UVC·UAC·PICC 등)", "D3", True,
+                _ck("a01_id", "환자 식별자", "D1", True, [_f("patient_info")], area=1),
+                _ck("a01_ga", "재태주령(GA)", "D1", True, [{"type": "chart_regex", "regex": "재태|gestational|\\bGA\\b|주수"}, {"type": "manual"}],
+                    area=1, mention_regex="재태|주수|\\bGA\\b"),
+                _ck("a01_bw", "출생체중", "D1", True, [{"type": "chart_regex", "regex": "출생 ?체중|birth ?weight"}, {"type": "manual"}],
+                    area=1, mention_regex="출생 ?체중|birth ?weight"),
+                _ck("a01_dol", "생후일", "D1", True, [_f("patient_info")], area=1, mention_regex="생후|입원 \\d+일째"),
+                _ck("a01_ca", "교정연령", "D1", True, [{"type": "chart_regex", "regex": "교정|corrected|\\bPMA\\b|\\bCGA\\b"}, {"type": "manual"}],
+                    area=1, mention_regex="교정|PMA|CGA"),
+                _ck("a01_wt", "현재 체중과 측정일", "D1", True, [_f("weight")], area=1),
+                _ck("a01_multi", "다태아 순번", "D1", True, [{"type": "chart_regex", "regex": "다태|쌍둥이|쌍태|twin|multiple|birth order"}, {"type": "manual"}],
+                    area=1, mention_regex="다태|쌍둥이|쌍태|twin"),
+                _ck("a02_sev", "중증도(안정·관찰 필요·불안정)", "D2", True, [_f("severity")], area=2, after_cdss=True, mention_regex="중증도|불안정|관찰 필요|안정"),
+                _ck("a02_prob", "활성 문제 목록", "D2", True, [_f("diagnosis_main", "diagnosis_other", "prematurity")], area=2),
+                _ck("a03_support", "호흡 지지 방식·설정", "D3", True, [_f("resp_support", "resp_change")], area=3),
+                _ck("a03_fio2", "FiO2", "D3", True, [{"type": "facts", "concepts": ["fio2"]}], area=3, gap_text="FiO2: 최근 기록 없음, 확인 필요.",
+                    mention_regex="FiO2"),
+                _ck("a03_target", "SpO2 목표 범위", "D3", True, [{"type": "chart_regex", "regex": "목표|target"}, {"type": "manual"}], area=3,
+                    mention_regex="목표"),
+                _ck("a03_gas", "최근 혈액가스", "D3", True, [_f("blood_gas")], area=3, gap_text="최근 혈액가스: 최근 72시간 기록 없음, 확인 필요.",
+                    mention_regex="혈액가스|ABG|VBG|CBG|pCO2"),
+                _ck("a04_ett", "ETT 크기·고정 깊이", "D3", True,
+                    [{"type": "chart_regex", "regex": "ETT|E-tube|기관내관|endotracheal|tube size|고정 ?깊이|fixation|depth"}, {"type": "manual"}],
+                    area=4, required_if="invasive_vent", mention_regex="ETT|기관내관|고정 ?깊이"),
+                _ck("a04_ogng", "OG·NG 위치", "D4", True, [{"type": "chart_regex", "regex": "\\bOG\\b|\\bNG\\b|위관|orogastric|nasogastric|L-tube|Levin"}, {"type": "manual"}],
+                    area=4, required_if="tube_feeding", mention_regex="OG|NG|위관 위치"),
+                _ck("a05_events", "무호흡·서맥·탈포화 사건 횟수", "D3", True, [_f("neo_events")], area=5, required_if="preterm",
+                    mention_regex="무호흡|서맥|탈포화|SpO2 \\d+% 미만"),
+                _ck("a05_interv", "사건 중재 강도(자가 회복·자극·산소)", "D3", True,
+                    [{"type": "chart_regex", "regex": "자극|stimulat|중재|intervention|자가 ?회복|bagging|BVM"}, {"type": "manual"}],
+                    area=5, required_if="preterm", mention_regex="중재|자극|자가 ?회복"),
+                _ck("a05_caffeine", "카페인 투여 여부", "D7", True, [{"type": "med_class", "classes": ["respiratory_stimulant"]}], area=5, required_if="preterm",
+                    gap_text="카페인: 기준 시각 투여 기록 없음.", mention_regex="카페인|caffeine"),
+                _ck("a06_hrbp", "HR·BP 범위", "D3", True, [{"type": "facts", "fact_types": ["vitals_24h"], "concepts": ["hr"]}], area=6),
+                _ck("a06_perf", "관류(CRT 등)", "D3", True, [{"type": "chart_regex", "regex": "CRT|capillary|관류|모세혈관|perfusion"}, {"type": "manual"}],
+                    area=6, mention_regex="관류|CRT|모세혈관"),
+                _ck("a06_vaso", "혈관작용제(약물·용량·속도)", "D7", True, [{"type": "med_class", "classes": ["vasopressor"]}], area=6,
+                    gap_text="혈관작용제: 기준 시각 투여 기록 없음.", mention_regex="혈관작용제|승압|강심|dopamine|dobutamine|epinephrine|milrinone"),
+                _ck("a07_temp", "체온 범위", "D3", True, [{"type": "facts", "fact_types": ["vitals_24h"], "concepts": ["temp"]}], area=7),
+                _ck("a07_env", "인큐베이터·보온기 모드, 습도", "D3", True,
+                    [{"type": "chart_regex", "regex": "인큐베이터|incubator|보온기|warmer|습도|humid|servo|air mode|isolette"}, {"type": "manual"}],
+                    area=7, mention_regex="인큐베이터|보온기|습도|incubator|warmer"),
+                _ck("a08_line", "라인 종류·삽입일", "D3", True,
                     [{"type": "proc_regex", "regex": LINE_RX, "note": "제거 여부는 데이터로 확인되지 않음"},
-                     {"type": "chart_regex", "regex": "insertion|삽입|catheter|카테터|UVC|UAC|PICC"}],
-                    mention_regex="UVC|UAC|PICC|제대|중심정맥|카테터|catheter|정맥관"),
-                _ck("infusions", "지속주입(승압·진정)·CRRT", "D3", False, [_f("infusion_episode", "crrt_episode")]),
-                _ck("procedures", "시술·영상검사", "D3", False, [_f("procedure", "imaging")]),
-                _ck("cranial_us", "뇌초음파(뇌실내출혈 선별)", "D3", False,
-                    [{"type": "facts", "fact_types": ["procedure", "imaging"], "text_regex": "brain|cranial|head|뇌"}, {"type": "proc_regex", "regex": "brain|cranial|head|뇌"}],
-                    mention_regex="뇌초음파|brain|cranial|뇌실내출혈|IVH"),
-                _ck("pending", "미결 배양·검사", "D3", True, [_f("micro_pending")], gap_text="미결 배양·검사: 데이터상 미보고 배양 없음, 미결 검사 확인 필요.",
-                    mention_regex="미보고|미결|pending|결과 대기"),
-                _ck("intake", "섭취(정맥·장관)와 mL/kg/일", "D4", True, [_f("intake_24h")]),
-                _ck("feeding_route", "수유·영양 경로", "D4", True,
-                    [{"type": "input_regex", "regex": "경구|oral|Levin|\\bOG\\b|\\bNG\\b|feeding|경관|수유|모유|분유"}, {"type": "med_class", "classes": ["nutrition"]}],
-                    mention_regex="수유|경관|경구|모유|분유|정맥영양|TPN|영양"),
-                _ck("urine", "소변량(mL/kg/h)", "D5", True, [_f("urine_24h")]),
-                _ck("stool", "대변", "D5", False, [_f("stool")]),
-                _ck("drains", "배액관", "D5", False, [_f("drain")]),
-                _ck("labs", "최근 검사", "D6", True, [_f("lab_latest", "lab_normal", "lab_none")]),
-                _ck("bilirubin", "빌리루빈", "D6", True, [{"type": "facts", "concepts": ["tbil"]}], gap_text="빌리루빈: 최근 24시간 검사 기록 없음, 필요 시 확인.",
-                    mention_regex="빌리루빈|bilirubin|T\\.bil|황달"),
-                _ck("glucose", "혈당", "D6", True, [{"type": "facts", "concepts": ["glucose", "bst"]}], gap_text="혈당: 최근 24시간 검사 기록 없음, 필요 시 확인.",
-                    mention_regex="혈당|glucose|BST"),
-                _ck("meds_active", "투여 중 약물", "D7", True, [_f("med_active", "fluids", "infusion_episode", status=None)]),
-                _ck("high_alert", "고위험 약물(승압제·진정제·인슐린·항응고제)", "D7", True,
-                    [{"type": "med_class", "classes": ["vasopressor", "sedation", "insulin", "anticoagulant"]}], gap_text="고위험 약물: 기준 시각 투여 중 기록 없음.",
-                    mention_regex="승압|진정|인슐린|항응고|dopamine|epinephrine|insulin|heparin"),
-                _ck("antibiotics", "항생제", "D7", False, [{"type": "med_class", "classes": ["antibiotic", "antifungal"]}]),
-                _ck("meds_changed", "오늘 중단한 약물", "D7", False, [_f("med_stopped")]),
+                     {"type": "chart_regex", "regex": "insertion|삽입|catheter|카테터|UVC|UAC|PICC|PIV|말초정맥"}],
+                    area=8, mention_regex="UVC|UAC|PICC|PIV|제대|중심정맥|카테터|catheter|정맥관"),
+                _ck("a08_depth", "라인 삽입 깊이·부위 상태", "D3", True, [{"type": "chart_regex", "regex": "삽입 ?깊이|insertion depth|부위 ?상태|site"}, {"type": "manual"}],
+                    area=8, mention_regex="삽입 ?깊이|부위"),
+                _ck("a08_infusion", "주입 내용·속도", "D4", True,
+                    [_f("infusion_episode", "fluids"), {"type": "med_class", "classes": ["nutrition"]}, _f("intake_24h")], area=8),
+                _ck("a09_route", "수유 방식(NPO·위관·경구)", "D4", True, [_f("intake_24h")], area=9, mention_regex="수유|경관|경구|NPO|금식|위관"),
+                _ck("a09_type", "수유 종류(모유·분유 등)", "D4", True,
+                    [{"type": "input_regex", "regex": "모유|분유|breast|formula|EBM|HMF|강화제"}, {"type": "chart_regex", "regex": "모유|분유|breast|formula|EBM"},
+                     {"type": "manual"}], area=9, mention_regex="모유|분유|EBM|formula"),
+                _ck("a09_amount", "수유 양·간격", "D4", True, [_f("intake_24h")], area=9),
+                _ck("a09_plan", "수유 증량 계획", "D4", True, [{"type": "chart_regex", "regex": "증량|advance"}, {"type": "manual"}], area=9, mention_regex="증량"),
+                _ck("a09_intol", "수유 불내성(잔류량·복부팽만·구토·혈변)", "D4", True,
+                    [{"type": "chart_regex", "regex": "잔류|residual|복부 ?팽만|abdominal girth|distension|구토|vomit|혈변|bloody"},
+                     {"type": "output_regex", "regex": "잔류|residual|구토|vomit|Levin tube-output|OG.*output"}, {"type": "manual"}],
+                    area=9, mention_regex="잔류|팽만|구토|혈변|불내성"),
+                _ck("a10_urine", "소변량(mL/kg/h)", "D5", True, [_f("urine_24h")], area=10),
+                _ck("a10_stool", "배변", "D5", True, [_f("stool")], area=10, gap_text="배변: 지난 24시간 기록 없음, 확인 필요.", mention_regex="배변|대변|stool"),
+                _ck("a10_glucose", "혈당", "D6", True, [{"type": "facts", "concepts": ["glucose", "bst"]}], area=10,
+                    gap_text="혈당: 최근 24시간 검사 기록 없음, 확인 필요.", mention_regex="혈당|glucose|BST"),
+                _ck("a10_wtchange", "체중 변화", "D1", True, [_f("weight")], area=10),
+                _ck("a10_bili", "빌리루빈", "D6", True, [{"type": "facts", "concepts": ["tbil"]}], area=10,
+                    gap_text="빌리루빈: 최근 24시간 검사 기록 없음, 확인 필요.", mention_regex="빌리루빈|bilirubin|T\\.bil|황달"),
+                _ck("a10_photo", "광선요법", "D6", True, [{"type": "proc_regex", "regex": "photo|광선"}, {"type": "chart_regex", "regex": "광선|photo"}, {"type": "manual"}],
+                    area=10, mention_regex="광선|photo"),
+                _ck("a11_meds", "투약과 마지막 투여 시각", "D7", True, [_f("med_active", "fluids", "infusion_episode", "med_stopped")], area=11,
+                    gap_text="투약: 기준 시각 투여 기록 없음."),
+                _ck("a11_sched", "정규 투약 시각", "D7", True, [{"type": "manual"}], area=11, mention_regex="정규 투약|투약 시각"),
+                _ck("a11_status", "투여 상태(투여·미투여·보류)와 사유", "D7", True, [_f("med_status"), {"type": "manual"}], area=11,
+                    mention_regex="미투여|보류|hold|not given"),
+                _ck("a11_high", "고위험약", "D7", True, [{"type": "med_class", "classes": ["vasopressor", "sedation", "insulin", "anticoagulant"]}], area=11,
+                    gap_text="고위험약: 기준 시각 투여 기록 없음.", mention_regex="고위험|승압|진정|인슐린|항응고"),
+                _ck("a12_neuro", "활동성·경련", "D3", True, [{"type": "chart_regex", "regex": "활동|activity|경련|seizure|tone|긴장도|irritab"}, {"type": "manual"}],
+                    area=12, mention_regex="활동성|경련|seizure"),
+                _ck("a12_pain", "통증·진정 점수", "D3", True, [{"type": "chart_regex", "regex": "통증|pain|N-PASS|NIPS|PIPP|진정|sedation|COMFORT"}, {"type": "manual"}],
+                    area=12, mention_regex="통증|진정 점수|N-PASS|NIPS|PIPP"),
+                _ck("a13_pending", "결과 대기 검사", "D3", True, [_f("micro_pending")], area=13, gap_text="결과 대기 검사: 데이터상 미보고 배양 없음, 그 외 대기 검사 확인 필요.",
+                    mention_regex="미보고|결과 대기|pending"),
+                _ck("a13_planned", "예정 검사·시술, 시각이 정해진 할 일", "D3", True, [{"type": "manual"}], area=13, mention_regex="예정"),
+                _ck("a14_plan", "비상 계획", "D8", False, [{"type": "chart_regex", "regex": "비상|contingency"}], area=14),
+                _ck("a15_family", "가족(면회·설명·캥거루케어·모유 공급·교육)", "D1", False,
+                    [{"type": "chart_regex", "regex": "보호자|면회|가족|캥거루|kangaroo|모유 ?공급|유축|교육"}], area=15),
+                _ck("a16_skin", "피부(기구 압박손상·테이프 손상·침윤)", "D3", False,
+                    [{"type": "chart_regex", "regex": "압박|pressure injury|테이프|tape|침윤|infiltrat|피부|skin|욕창"}], area=16),
+                _ck("a17_iso", "감염·격리", "D1", False,
+                    [{"type": "micro_org_regex", "regex": "MRSA|VRE|CRE|CRAB|CRPA|carbapenem|methicillin.resistant|vancomycin.resistant"},
+                     {"type": "chart_regex", "regex": "격리|isolation"}], area=17),
             ],
         },
         "parent": {
@@ -652,6 +700,12 @@ DEFAULT_PROFILE = {
     "concepts": {"chart_extra": [], "lab_extra": [], "med_class_extra": []},   # 병원 고유 라벨 추가(우선 적용)
     "cdss": {"disabled": [], "severity_override": {}},   # 규칙 끄기·심각도 조정. rule_id 접두어 허용(예: "CRITICAL_LAB")
     "dur_pairs": [],             # [성분A, 성분B, 사유]
+    "severity": {                # 중증도 3단계 판정 규칙(위에서부터 먼저 만족하는 단계). 근거는 기록지에 함께 표시
+        "section": "D2",
+        "unstable": {"alert_severity": ["high"], "resp_kind": ["invasive", "vent_unknown"], "active_classes": ["vasopressor"]},
+        "watcher": {"alert_severity": ["medium"], "resp_kind": ["noninvasive", "o2"], "fact_status": ["neo_events:present"]},
+    },
+    "sampling": {},              # 임상 평가용 표본 추출 기준 덮어쓰기(기본값은 SAMPLING_DEFAULT 참고). 예: {"max_age_days": 28, "min_bp": 0}
 }
 
 PROFILE = None
@@ -863,19 +917,41 @@ def eval_source(ctx, facts, item, src, doc):
     return []  # manual
 
 
-def apply_checklist(ctx, facts, doc):
+def _required(ctx, facts, item):
+    """Core 여부. required_if 가 있으면 해당 환아에게만 필수."""
+    if not item.get("required"):
+        return False
+    cond = item.get("required_if")
+    if not cond:
+        return True
+    if cond == "preterm":
+        return any(f.ftype == "prematurity" for f in facts)
+    if cond == "invasive_vent":
+        return getattr(ctx, "resp_kind", None) in ("invasive", "vent_unknown")
+    if cond == "tube_feeding":
+        return any(f.ftype == "intake_24h" and f.extra.get("tube") for f in facts)
+    if cond == "neonate":
+        return bool(ctx.is_neonate)
+    return True
+
+
+def apply_checklist(ctx, facts, doc, post=False):
+    """post=False: CDSS 이전 판정(after_cdss 항목 제외). post=True: after_cdss 항목만 판정(중증도 등)."""
     added = []
-    ctx.checklist[doc] = []
+    if not post:
+        ctx.checklist[doc] = []
     D = PROFILE["documents"][doc]
     pre = "chk:" if doc == "summary" else "pchk:"
     for item in D["checklist"]:
+        if bool(item.get("after_cdss")) != post:
+            continue
         got, used = [], None
         for src in item.get("sources", []):
             got = eval_source(ctx, facts + added, item, src, doc)
             if got:
                 used = src["type"]
                 break
-        req = bool(item.get("required"))
+        req = _required(ctx, facts + added, item)
         if got:
             for f in got:
                 if f not in facts and f not in added:
@@ -883,7 +959,7 @@ def apply_checklist(ctx, facts, doc):
                 if req and doc == "summary":
                     f.salience = max(f.salience, 2)
                 f.concepts.add(pre + item["key"])
-            ctx.checklist[doc].append({"item": item, "facts": got, "source": used, "status": "data"})
+            ctx.checklist[doc].append({"item": item, "facts": got, "source": used, "status": "data", "req": req})
         elif req:
             if doc == "summary":
                 txt = item.get("gap_text") or "%s: 데이터에 기록 없음, 확인 필요." % item["label"]
@@ -892,9 +968,12 @@ def apply_checklist(ctx, facts, doc):
                 txt = item.get("gap_text") or D.get("gap_text", "{label}: 기록에서 확인되지 않았습니다.").format(label=item["label"])
                 g = Fact("parent_gap", item["section"], txt, 1, concepts={pre + item["key"]}, status="gap", extra={"checklist": item["key"]})
             added.append(g)
-            ctx.checklist[doc].append({"item": item, "facts": [g], "source": "gap", "status": "gap"})
+            ctx.checklist[doc].append({"item": item, "facts": [g], "source": "gap", "status": "gap", "req": True})
         else:
-            ctx.checklist[doc].append({"item": item, "facts": [], "source": None, "status": "absent"})
+            ctx.checklist[doc].append({"item": item, "facts": [], "source": None, "status": "absent" if not item.get("required") else "n/a", "req": False})
+    if post:
+        order = {it["key"]: i for i, it in enumerate(D["checklist"])}
+        ctx.checklist[doc].sort(key=lambda c: order.get(c["item"]["key"], 999))
     return added
 
 
@@ -902,7 +981,8 @@ def checklist_report(ctx, doc):
     rows = []
     for c in ctx.checklist.get(doc, []):
         it = c["item"]
-        rows.append({"key": it["key"], "label": it["label"], "section": it["section"], "required": bool(it.get("required")),
+        rows.append({"key": it["key"], "area": it.get("area"), "label": it["label"], "section": it["section"],
+                     "required": bool(c.get("req", it.get("required"))),
                      "status": c["status"], "source": c["source"], "fact_ids": [f.fid for f in c["facts"]]})
     return rows
 
@@ -914,7 +994,7 @@ def checklist_in_note(V, sents, verdicts, report, doc="summary"):
     pre = "chk:" if doc == "summary" else "pchk:"
     out = []
     for r in report:
-        if r["status"] == "absent" and not r["required"]:
+        if r["status"] in ("absent", "n/a") and not r["required"]:
             out.append(dict(r, in_note="n/a"))
             continue
         fids = set(r["fact_ids"])
@@ -1256,13 +1336,16 @@ def info_facts(ctx):
     admit = to_dt(pd.Series([adm.get("admittime") if hasattr(adm, "get") else None])).iloc[0]
     unit = ctx.row.get("first_careunit") or "ICU"
     icu_day = (ctx.t0.normalize() - ctx.intime.normalize()).days + 1
-    parts = [("%s세 %s" % (fmt_num(ctx.age), sex_ko)) if (not neo and ctx.age is not None) else sex_ko]
+    parts = ["환자 ID %s" % ctx.subject_id, ("%s세 %s" % (fmt_num(ctx.age), sex_ko)) if (not neo and ctx.age is not None) else sex_ko]
     nums = []
     if pd.notna(admit):
         ctx.admit = pd.Timestamp(admit)
         ctx.hosp_day = (ctx.t0.normalize() - ctx.admit.normalize()).days + 1
         parts.append("입원 %d일째(입원 %s)" % (ctx.hosp_day, fmt_t(admit)))
         nums.append(ctx.hosp_day)
+        if neo:
+            ctx.age_days = int((ctx.t0 - ctx.admit).total_seconds() // 86400)
+            parts.append("생후 약 %d일(입원 시각을 출생 시각으로 근사)" % ctx.age_days)
     else:
         ctx.admit, ctx.hosp_day = ctx.intime, icu_day
     parts.append("%s 입실 %d일째(입실 %s)" % (unit, icu_day, fmt_t(ctx.intime)))
@@ -1377,7 +1460,8 @@ def resp_facts(ctx):
         if len(peep):
             parts.append("PEEP %s cmH2O" % fmt_num(peep.iloc[-1]))
         txt = "호흡 보조(최근 %s시간): %s%s." % (fmt_num(RH), name, (" (" + ", ".join(parts) + ")") if parts else "")
-        facts.append(Fact("resp_support", "D3", txt, 3, concepts={"resp"} | ({"ev_vent"} if kind != "noninvasive" else set()), status="active",
+        facts.append(Fact("resp_support", "D3", txt, 3, concepts={"resp"} | ({"ev_vent"} if kind != "noninvasive" else set()) | ({"fio2"} if fio2 is not None else set()),
+                          status="active",
                           time=vent["t"].max(), prov=_prov("CHARTEVENTS", vent.tail(2), "chartevent_id"), extra={"kind": kind, "mode": mode, "fio2": fio2}))
     else:
         o2 = rec[rec["concept"] == "o2_flow"].dropna(subset=["v"]).sort_values("t")
@@ -1583,7 +1667,8 @@ def nutrition_facts(ctx):
         txt += ", %s mL/kg/일(체중 %s 기준%s)" % (fmt_num(round(mkd)), fmt_w(ctx.wt_kg), ", 24시간 환산" if H < 23 else "")
         nums.append(round(mkd))
     facts.append(Fact("intake_24h", "D4", txt + ".", 3, concepts={"intake", "io"}, key_nums=nums, prov=_prov("INPUTEVENTS", d.head(3), "inputevent_id"),
-                      extra={"total": round(total), "iv": round(sums["in_iv"]), "enteral": round(ent), "mlkgday": ctx.intake_ml_kg_day}))
+                      extra={"total": round(total), "iv": round(sums["in_iv"]), "enteral": round(ent), "tube": round(sums["in_tube"]),
+                             "oral": round(sums["in_oral"]), "mlkgday": ctx.intake_ml_kg_day}))
     return facts
 
 
@@ -1708,6 +1793,20 @@ def lab_facts(ctx):
         if not ctx.latest_labs:
             lt = ctx.lab[ctx.lab["t"] <= ctx.t0]["t"].max()
             facts.append(Fact("lab_none", "D6", "최근 %s시간 내 검사 기록 없음(마지막 검사 %s)." % (fmt_num(LH), fmt_t(lt)), 2, concepts={"labs_none"}, time=lt))
+        bg = [c for c in ("ph", "pco2", "po2", "hco3") if c in LAB_DISPLAY]
+        G = ctx.lab[ctx.lab["concept"].isin(bg) & (ctx.lab["t"] <= ctx.t0) & (ctx.lab["t"] > ctx.t0 - pd.Timedelta(hours=72))].dropna(subset=["v"])
+        if len(G):
+            tl = G["t"].max()
+            last = G[G["t"] >= tl - pd.Timedelta(minutes=30)]
+            parts, vals, cs = [], [], set()
+            for c in bg:
+                x = last[last["concept"] == c].sort_values("t")
+                if len(x):
+                    parts.append("%s %s" % (LAB_DISPLAY[c], fmt_num(x["v"].iloc[-1])))
+                    vals.append(float(x["v"].iloc[-1]))
+                    cs.add(c)
+            facts.append(Fact("blood_gas", "D6", "최근 혈액가스(%s): %s." % (fmt_t(tl), ", ".join(parts)), 2, concepts={"blood_gas"} | cs, key_nums=vals, time=tl,
+                              prov=_prov("LABEVENTS", last, "labevent_id")))
         for c in PROFILE.get("trend_labs", []):
             s = ctx.lab[(ctx.lab["concept"] == c) & (ctx.lab["t"] <= ctx.t0)].dropna(subset=["v"]).sort_values("t")
             if len(s) < 2 or s["t"].iloc[-1] <= ctx.win_start:
@@ -1737,6 +1836,8 @@ def lab_facts(ctx):
                               concepts={"bst", "glucose"}, key_nums=[lo, hi], prov=_prov("CHARTEVENTS", b.head(3), "chartevent_id")))
     return facts
 
+
+NOT_GIVEN_RX = r"not given|held|hold|보류|미투여|refus|거부|missed|omitted|delay|지연|투여 ?안 ?함"
 
 CLS_KO = {"vasopressor": "승압·강심제", "sedation": "진정·진통제", "insulin": "인슐린", "anticoagulant": "항응고제", "antiplatelet": "항혈소판제",
           "antibiotic": "항생제", "antifungal": "항진균제", "diuretic": "이뇨제", "respiratory_stimulant": "호흡자극제", "surfactant": "폐표면활성제",
@@ -1817,6 +1918,19 @@ def med_facts(ctx):
             txt = "%s%s(%s) 오늘 중단, 마지막 기록 %s." % ((ck + " ") if ck else "", r["generic"], r["name"], fmt_t(r["last"]))
             facts.append(Fact("med_stopped", "D7", txt, 2, concepts={"med:" + r["generic"].lower(), "cls:" + r["cls"]}, status="stopped", time=r["last"],
                               prov=r["prov"], extra=ex))
+    if not ctx.emar.empty and "event_txt" in ctx.emar.columns:
+        e = ctx.win(ctx.emar)
+        ne = e[e["event_txt"].astype(str).str.contains(NOT_GIVEN_RX, case=False, regex=True, na=False)]
+        if len(ne):
+            parts = []
+            for (g, ev), gg in ne.groupby(["generic", "event_txt"]):
+                why = ""
+                if "note_txt" in gg.columns:
+                    nt = [str(x) for x in gg["note_txt"].dropna().unique() if str(x) not in ("nan", "")]
+                    why = (", 사유 기록: %s" % "; ".join(nt[:2])) if nt else ""
+                parts.append("%s %s %d건(마지막 %s%s)" % (g, ev, len(gg), fmt_t(gg["t"].max()), why))
+            facts.append(Fact("med_status", "D7", "지난 %s시간 투여 상태 기록: %s." % (HH(ctx), "; ".join(parts[:6])), 2, concepts={"med_status"},
+                              prov=_prov("EMAR", ne.head(3), "emar_id")))
     if fluids:
         facts.append(Fact("fluids", "D7", "수액 투여 중: %s." % ", ".join(sorted(set(f["name"] for f in fluids))), 1,
                           concepts={"cls:fluid"} | {"med:" + f["generic"].lower() for f in fluids}, status="active"))
@@ -1827,6 +1941,63 @@ def med_facts(ctx):
 # 4. CDSS — NICU 규칙(결정론). 기준값은 프로파일 neonatal/critical_values/tdm 에서 읽음.
 #    알림 문장은 근거 fact 값만 사용하고, 계산값은 출처가 남는 파생 fact로 등록해 검증기 대조 대상에 포함.
 # =============================================================================
+
+
+def add_severity(ctx, facts, alerts):
+    """중증도 3단계(불안정 > 관찰 필요 > 안정)를 프로파일 severity 규칙으로 판정하고 근거와 함께 fact로 등록."""
+    R = PROFILE.get("severity", {})
+    rk_ko = {"invasive": "침습적 인공호흡", "vent_unknown": "인공호흡기 사용", "noninvasive": "비침습 호흡 보조", "o2": "산소 투여"}
+    sev_ko = {"high": "고위험", "medium": "중간", "info": "참고"}
+
+    def hit(rule):
+        reasons, trig = [], []
+        for sv in rule.get("alert_severity", []):
+            al = [a for a in alerts if a["severity"] == sv]
+            if al:
+                reasons.append("%s 알림: %s" % (sev_ko.get(sv, sv), ", ".join(dict.fromkeys(a["title"] for a in al))))
+                trig += [t for a in al for t in a["trigger_fact_ids"]]
+        rk = getattr(ctx, "resp_kind", None)
+        if rk in rule.get("resp_kind", []):
+            reasons.append(rk_ko.get(rk, rk))
+            trig += [f.fid for f in facts if f.ftype == "resp_support"]
+        cls = set(rule.get("active_classes", []))
+        act = [f for f in facts if f.ftype in ("infusion_episode", "med_active") and f.status == "active" and f.extra.get("cls") in cls]
+        if act:
+            reasons.append("%s 투여 중" % ", ".join(dict.fromkeys("%s %s" % (CLS_KO.get(f.extra["cls"], ""), f.extra["generic"]) for f in act)))
+            trig += [f.fid for f in act]
+        for fs in rule.get("fact_status", []):
+            ft, st = fs.split(":")
+            fl = [f for f in facts if f.ftype == ft and f.status == st]
+            if fl:
+                reasons.append({"neo_events": "무호흡·서맥·탈포화 기록"}.get(ft, ft))
+                trig += [f.fid for f in fl]
+        return reasons, trig
+
+    level, reasons, trig = "안정", ["고위험·중간 알림, 침습적 호흡 보조, 혈관작용제 투여 없음"], []
+    for key, name in (("unstable", "불안정"), ("watcher", "관찰 필요")):
+        r, t = hit(R.get(key, {}))
+        if r:
+            level, reasons, trig = name, r, t
+            break
+    sec = R.get("section", "D2")
+    f = Fact("severity", sec, "중증도: %s(규칙 기반 판정). 근거: %s." % (level, "; ".join(reasons)), 3, concepts={"severity"}, status=level,
+             prov=[{"derived_from": list(dict.fromkeys(trig))}], extra={"level": level})
+    f.fid = "F%03d" % (len(facts) + 1)
+    idx = next((i for i, x in enumerate(facts) if x.section == sec), len(facts))
+    facts.insert(idx, f)
+    ctx.severity = level
+    return f
+
+
+def finalize_facts(ctx, facts, alerts):
+    """CDSS 이후 단계: 중증도 판정, after_cdss 체크리스트 항목 판정, 새 fact 에 ID 부여."""
+    add_severity(ctx, facts, alerts)
+    for doc in ("summary", "parent"):
+        new = apply_checklist(ctx, facts, doc, post=True)
+        for g in new:
+            if g not in facts:
+                g.fid = "F%03d" % (len(facts) + 1)
+                facts.append(g)
 
 
 def run_cdss(ctx, facts, dur_pairs=None):
@@ -2234,11 +2405,11 @@ def note_markdown(ctx, sents, verdicts=None, coverage=None, title=None, checklis
                                                                      fmt_num(100 * (extra_metrics.get("read_english_sent_ratio") or 0))))
     if show_cites and checklist:
         gaps = [c for c in checklist if c["status"] == "gap"]
-        lines += ["", "## 필수 항목 체크리스트 (%s)" % PROFILE.get("profile_name", ""), "", "| 항목 | 필수 | 데이터 | 문서 반영 | 근거 |", "|---|---|---|---|---|"]
-        lab = {"data": "있음", "gap": "없음(확인 필요)", "absent": "없음"}
+        lines += ["", "## 필수 항목 체크리스트 (%s)" % PROFILE.get("profile_name", ""), "", "| 영역 | 항목 | 필수 | 데이터 | 문서 반영 | 근거 |", "|---|---|---|---|---|---|"]
+        lab = {"data": "있음", "gap": "없음(확인 필요)", "absent": "없음", "n/a": "해당 없음"}
         inl = {"covered": "반영", "missing": "누락", "n/a": "-"}
         for c in checklist:
-            lines.append("| %s | %s | %s | %s | %s |" % (c["label"], "필수" if c["required"] else "선택", lab.get(c["status"], c["status"]),
+            lines.append("| %s | %s | %s | %s | %s | %s |" % (c.get("area") or "", c["label"], "필수" if c["required"] else "선택", lab.get(c["status"], c["status"]),
                                                        inl.get(c.get("in_note", "-"), c.get("in_note", "-")), ", ".join(c["fact_ids"][:4])))
         if gaps:
             lines += ["", "- 데이터에 없어 직접 확인할 항목: " + ", ".join(c["label"] for c in gaps)]
@@ -2977,6 +3148,7 @@ class Pipeline(object):
         facts = build_facts(ctx)
         audit.log("build_facts", {"stay_id": stay_id, "t0": str(ctx.t0), "day": ctx.day_index}, {"n_facts": len(facts), "n_must": sum(f.must for f in facts)}, time.time() - t1)
         alerts = run_cdss(ctx, facts, self.dur)
+        finalize_facts(ctx, facts, alerts)
         audit.log("cdss", {"facts": [f.fid for f in facts]}, {"alerts": [a["rule_id"] for a in alerts]})
         judge = llm if (llm is not None and llm.ok) else None
         res = {"ctx": ctx, "facts": facts, "alerts": alerts}
@@ -3280,12 +3452,193 @@ def cmd_evaluate_note(a):
     print("[out] %s.md / .json" % base)
 
 
+# =============================================================================
+# 9. 임상 평가용 표본 추출 (sample): 생후 28일 이하 NICU 환아의 (person_id, 평가 시점) 무작위 추출
+#    평가 시점 = 매일 cutoff 시각(기본 07:00). 생성은 이 시각 이전 기록만, 특히 직전 24시간 기록으로 한다.
+#    직전 24시간 데이터가 부족해 Core 인계 항목을 만들 수 없는 시점은 제외한다. 기준값은 프로파일 sampling 에서 수정.
+# =============================================================================
+
+SAMPLING_DEFAULT = {
+    "max_age_days": 28,                 # 평가 시점 생후 일수 상한(출생일 = 0일)
+    "birth_columns": ["dob", "birth_datetime", "birthdate", "birth_time", "date_of_birth"],
+    "birth_proxy_max_hours": 48,        # 생년월일 컬럼이 없으면: 나이 0세이고 입원→NICU 입실 48시간 이내일 때만 입원 시각을 출생 시각으로 근사
+    "min_icu_hours_before": 24,         # 평가 시점 직전 24시간 전체가 같은 NICU 재실 기간 안
+    "min_hr": 6, "min_spo2": 6, "min_temp": 2, "min_bp": 1,   # 직전 24시간 기록 건수 하한(호흡·순환·체온 항목)
+    "weight_within_days": 7,            # 평가 시점 이전 7일 안에 체중 기록(현재 체중·mL/kg 계산)
+    "min_intake_records": 1,            # 직전 24시간 섭취(수액·수유) 기록(영양·수액 항목)
+    "min_urine_records": 1,             # 직전 24시간 소변 기록(배설 항목)
+    "exclude_after_death": True,        # 사망 시각 이후 시점 제외
+    "one_per_person": True,             # 한 환아당 한 시점(같은 환아의 여러 날이 표본을 차지하지 않게)
+    "dol_strata": [[0, 3], [4, 7], [8, 14], [15, 28]],   # --stratify 시 생후일 구간별 균등 추출
+}
+
+
+def _np():
+    import numpy as np
+    return np
+
+
+def _times_by(df, keycol, tcol, mask=None):
+    """hadm별 정렬된 시각 배열 dict."""
+    np = _np()
+    if df is None or df.empty or tcol not in df.columns:
+        return {}
+    d = df if mask is None else df[mask]
+    t = to_dt(d[tcol])
+    d = d.assign(_t=t).dropna(subset=["_t"])
+    return {k: np.sort(g["_t"].values) for k, g in d.groupby(keycol)}
+
+
+def _count(arr, a, b):
+    """(a, b] 구간 건수."""
+    np = _np()
+    if arr is None or len(arr) == 0:
+        return 0
+    return int(np.searchsorted(arr, np.datetime64(b), side="right") - np.searchsorted(arr, np.datetime64(a), side="right"))
+
+
+def _last_before(arr, b):
+    np = _np()
+    if arr is None or len(arr) == 0:
+        return None
+    i = np.searchsorted(arr, np.datetime64(b), side="right")
+    return pd.Timestamp(arr[i - 1]) if i > 0 else None
+
+
+def birth_times(p, S):
+    """stay별 (출생 시각, 출처). 생년월일 컬럼 우선, 없으면 입원 시각 근사(조건부)."""
+    pats = p.kd.get("PATIENTS")
+    adm = p.kd.get("ADMISSIONS")
+    col = next((c for c in S["birth_columns"] if c in pats.columns), None) if not pats.empty else None
+    bmap = {}
+    if col:
+        bt = to_dt(pats[col])
+        bmap = dict(zip(pats["subject_id"], bt))
+    amap = dict(zip(adm["hadm_id"], to_dt(adm["admittime"]))) if (not adm.empty and "admittime" in adm.columns) else {}
+    out = {}
+    for _, r in p.cands.iterrows():
+        b = bmap.get(r["subject_id"]) if col else None
+        if b is not None and pd.notna(b):
+            out[r["stay_id"]] = (pd.Timestamp(b), "PATIENTS.%s" % col)
+            continue
+        age = to_num(pd.Series([r.get("anchor_age")])).iloc[0]
+        a = amap.get(r["hadm_id"])
+        if pd.notna(age) and age < 1 and a is not None and pd.notna(a) and \
+                0 <= (pd.Timestamp(r["intime_dt"]) - pd.Timestamp(a)).total_seconds() <= S["birth_proxy_max_hours"] * 3600:
+            out[r["stay_id"]] = (pd.Timestamp(a), "입원 시각 근사")
+        else:
+            out[r["stay_id"]] = (None, "출생 시각 확인 불가")
+    return out
+
+
+def cmd_sample(a):
+    S = dict(SAMPLING_DEFAULT)
+    p = mk(a)
+    S.update(PROFILE.get("sampling", {}))
+    C = p.cands.copy()
+    hadms = C["hadm_id"].tolist()
+    print("[sample] 코호트 %d stay의 이벤트를 읽는 중..." % len(C))
+    chart = p.kd.get("CHARTEVENTS", hadms)
+    if not chart.empty:
+        chart = chart.assign(concept=chart["itemid"].map(lambda i: p.item_map.get(i, (None,))[0]))
+    want = {"hr": ("hr",), "spo2": ("spo2",), "temp": ("temp",), "bp": ("sbp", "map", "dbp"), "weight": ("weight",),
+            "resp": tuple(VENT_CONCEPTS | {"fio2", "o2_flow"})}
+    T = {k: _times_by(chart, "hadm_id", "charttime", chart["concept"].isin(v)) if not chart.empty else {} for k, v in want.items()}
+    inp = p.kd.get("INPUTEVENTS", hadms)
+    T["intake"] = _times_by(inp, "hadm_id", "starttime")
+    out = p.kd.get("OUTPUTEVENTS", hadms)
+    if not out.empty:
+        out = out.assign(concept=out["itemid"].map(lambda i: p.item_map.get(i, (None,))[0]))
+        T["urine"] = _times_by(out, "hadm_id", "charttime", out["concept"] == "urine")
+    else:
+        T["urine"] = {}
+    T["lab"] = _times_by(p.kd.get("LABEVENTS", hadms), "hadm_id", "charttime")
+    T["emar"] = _times_by(p.kd.get("EMAR", hadms), "hadm_id", "charttime")
+    adm = p.kd.get("ADMISSIONS")
+    death = dict(zip(adm["hadm_id"], to_dt(adm["deathtime"]))) if (not adm.empty and "deathtime" in adm.columns) else {}
+    births = birth_times(p, S)
+    steps = ["1. NICU 코호트 후보 시점(매일 %02d:00)" % int(PROFILE["daily"]["cutoff_hour"]), "2. 출생 시각 확인 가능",
+             "3. 직전 %d시간 전체가 NICU 재실 중" % S["min_icu_hours_before"], "4. 생후 %d일 이하" % S["max_age_days"], "5. 사망 이전 시점",
+             "6. 활력징후 충분(HR≥%d, SpO2≥%d, 체온≥%d, 혈압≥%d)" % (S["min_hr"], S["min_spo2"], S["min_temp"], S["min_bp"]),
+             "7. %d일 내 체중 기록" % S["weight_within_days"], "8. 섭취 기록≥%d" % S["min_intake_records"], "9. 소변 기록≥%d" % S["min_urine_records"]]
+    flow = [[0, set()] for _ in steps]
+    rows = []
+    for _, r in C.iterrows():
+        sid, h, person = r["stay_id"], r["hadm_id"], r["subject_id"]
+        intime, outtime = pd.Timestamp(r["intime_dt"]), pd.Timestamp(r["outtime_dt"])
+        t0s = [t for t in day_t0s(r) if t.hour == int(PROFILE["daily"]["cutoff_hour"]) and t.minute == 0]
+        b, bsrc = births.get(sid, (None, None))
+        for k, t0 in enumerate(day_t0s(r), 1):
+            if t0 not in t0s:
+                continue  # 퇴실 시각 같은 비정규 시점은 평가 시점에서 제외
+            ws = t0 - pd.Timedelta(hours=24)
+            ok = [True]
+            ok.append(b is not None)
+            ok.append(ok[-1] and (t0 - intime).total_seconds() >= S["min_icu_hours_before"] * 3600 and t0 <= outtime)
+            age_days = int((t0 - b).total_seconds() // 86400) if b is not None else None
+            ok.append(ok[-1] and age_days is not None and 0 <= age_days <= S["max_age_days"])
+            dt_ = death.get(h)
+            ok.append(ok[-1] and not (S["exclude_after_death"] and dt_ is not None and pd.notna(dt_) and pd.Timestamp(dt_) <= t0))
+            n = {k2: _count(T[k2].get(h), ws, t0) for k2 in ("hr", "spo2", "temp", "bp", "intake", "urine", "lab", "emar", "resp")}
+            ok.append(ok[-1] and n["hr"] >= S["min_hr"] and n["spo2"] >= S["min_spo2"] and n["temp"] >= S["min_temp"] and n["bp"] >= S["min_bp"])
+            lw = _last_before(T["weight"].get(h), t0)
+            wdays = round((t0 - lw).total_seconds() / 86400.0, 1) if lw is not None else None
+            ok.append(ok[-1] and wdays is not None and wdays <= S["weight_within_days"])
+            ok.append(ok[-1] and n["intake"] >= S["min_intake_records"])
+            ok.append(ok[-1] and n["urine"] >= S["min_urine_records"])
+            for i, v in enumerate(ok):
+                if v:
+                    flow[i][0] += 1
+                    flow[i][1].add(person)
+            if all(ok):
+                rows.append({"person_id": person, "index_date": t0.strftime("%Y-%m-%d"), "index_datetime": str(t0), "stay_id": sid, "hadm_id": h,
+                             "kcd_day": k, "age_days": age_days, "birth_source": bsrc, "icu_day": (t0.normalize() - intime.normalize()).days + 1,
+                             "n_hr_24h": n["hr"], "n_spo2_24h": n["spo2"], "n_temp_24h": n["temp"], "n_bp_24h": n["bp"], "n_resp_24h": n["resp"],
+                             "n_intake_24h": n["intake"], "n_urine_24h": n["urine"], "n_lab_24h": n["lab"], "n_emar_24h": n["emar"], "weight_days_ago": wdays})
+    elig = pd.DataFrame(rows)
+    os.makedirs(a.out, exist_ok=True)
+    fl = pd.DataFrame([{"step": s, "candidate_days": f[0], "persons": len(f[1])} for s, f in zip(steps, flow)])
+    fl.to_csv(os.path.join(a.out, "sample_flow.csv"), index=False)
+    print("\n[선정 흐름]\n" + fl.to_string(index=False))
+    if elig.empty:
+        print("\n조건을 만족하는 평가 시점이 없습니다. sample_flow.csv 에서 탈락 단계를 확인하고 프로파일 sampling 기준을 조정하세요.")
+        return
+    rnd = random.Random(a.seed)
+    if S["one_per_person"]:
+        elig = elig.sample(frac=1.0, random_state=rnd.randrange(10 ** 9)).drop_duplicates("person_id").reset_index(drop=True)
+    strata = S["dol_strata"]
+    elig["dol_stratum"] = elig["age_days"].map(lambda d: next(("%d-%d일" % (lo, hi) for lo, hi in strata if lo <= d <= hi), "기타"))
+    n = a.n
+    if a.stratify:
+        per = max(1, n // len(strata))
+        parts = []
+        for lo, hi in strata:
+            g = elig[elig["dol_stratum"] == "%d-%d일" % (lo, hi)]
+            parts.append(g.sample(n=min(per, len(g)), random_state=a.seed) if len(g) else g)
+        smp = pd.concat(parts)
+    else:
+        smp = elig.sample(n=min(n, len(elig)), random_state=a.seed)
+    smp = smp.sort_values(["index_date", "person_id"]).reset_index(drop=True)
+    smp.insert(0, "sample_no", range(1, len(smp) + 1))
+    smp.to_csv(os.path.join(a.out, "nicu_sample.csv"), index=False)
+    elig.to_csv(os.path.join(a.out, "nicu_eligible_one_per_person.csv"), index=False)
+    with open(os.path.join(a.out, "nicu_sample_commands.sh"), "w", encoding="utf-8") as f:
+        f.write("# 표본별 1일 요약지·부모님 설명지 생성 명령\n")
+        for _, x in smp.iterrows():
+            f.write("python kcd_nicu.py run --data %s --stay %s --day %d --out %s%s\n" % (a.data, x["stay_id"], x["kcd_day"], os.path.join(a.out, "generated"),
+                                                                                   (" --profile %s" % a.profile) if a.profile else ""))
+    print("\n[표본] 적격 환아 %d명 중 %d명 추출 (seed=%d%s)" % (len(elig), len(smp), a.seed, ", 생후일 층화" if a.stratify else ""))
+    print(smp["dol_stratum"].value_counts().sort_index().to_string())
+    print("\n[out] %s/nicu_sample.csv, sample_flow.csv, nicu_eligible_one_per_person.csv, nicu_sample_commands.sh" % a.out)
+    print("주의: nicu_sample.csv 에는 person_id 와 날짜가 있으므로 분석환경 밖으로 반출하지 마세요. 외부 공유는 sample_flow.csv 집계만.")
+
+
 def kcd_main(argv=None):
     if isinstance(argv, str):
         argv = argv.split()
     ap = argparse.ArgumentParser(description="K-MIMIC NICU 1일 요약지·부모님 설명지 생성·검증·CDSS")
     sp = ap.add_subparsers(dest="cmd")
-    for name in ("list", "run", "batch", "perturb", "arms", "init-profile", "profile-check", "evaluate-note"):
+    for name in ("list", "run", "batch", "perturb", "arms", "init-profile", "profile-check", "evaluate-note", "sample"):
         s = sp.add_parser(name)
         s.add_argument("--data", required=(name != "init-profile"))
         s.add_argument("--profile", default=None, help="병원 프로파일 JSON(없으면 기본 양식)")
@@ -3301,6 +3654,7 @@ def kcd_main(argv=None):
         s.add_argument("--note", default=None, help="evaluate-note: 평가할 문서 파일")
         s.add_argument("--dur-csv", default=None, help="병용금기 CSV(성분A,성분B,사유)")
         s.add_argument("--no-write", action="store_true")
+        s.add_argument("--stratify", action="store_true", help="sample: 생후일 구간별 균등 추출")
         s.add_argument("--time-unit", default=None, help="시간 컬럼이 숫자(상대시간)일 때 단위 D/h/min")
     a = ap.parse_args(argv)
     if not a.cmd:
@@ -3310,7 +3664,7 @@ def kcd_main(argv=None):
         global TIME_UNIT
         TIME_UNIT = a.time_unit
     {"list": cmd_list, "run": cmd_run, "batch": cmd_batch, "perturb": cmd_perturb, "arms": cmd_arms, "init-profile": cmd_init_profile,
-     "profile-check": cmd_profile_check, "evaluate-note": cmd_evaluate_note}[a.cmd](a)
+     "profile-check": cmd_profile_check, "evaluate-note": cmd_evaluate_note, "sample": cmd_sample}[a.cmd](a)
 
 
 if __name__ == "__main__" and not in_notebook_paste():
