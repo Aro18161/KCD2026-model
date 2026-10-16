@@ -1,0 +1,9 @@
+perturbation,n,detected,recall
+num_change,390,389,0.9974
+drug_swap,140,140,1.0
+time_shift,400,399,0.9975
+status_flip,314,314,1.0
+fabricate,400,400,1.0
+delete,400,345,0.8625
+clean_sentences_false_flag,5551,0,0.0
+unperturbed_in_perturbed_false_flag,45183,0,0.0
